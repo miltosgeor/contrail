@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "contrail"
+version = "0.1.0"
+description = "A trace store and analysis layer for Claude agent runs."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Miltiades Georgantzis" }]
+keywords = ["observability", "opentelemetry", "llm-agents", "claude"]
+
+dependencies = [
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.27",
+    "opentelemetry-proto>=1.24",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "httpx>=0.27",
+    "ruff>=0.4",
+]
+
+[project.scripts]
+contrail = "contrail.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["contrail*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 96
+target-version = "py310"
