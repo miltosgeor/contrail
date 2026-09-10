@@ -184,6 +184,12 @@ class TranscriptRecord:
     output_tokens: int = 0
     cache_read_tokens: int = 0
     cache_creation_tokens: int = 0
+    # Cache writes price differently by TTL, so the split is kept.
+    cache_write_5m_tokens: int = 0
+    cache_write_1h_tokens: int = 0
+    # Billed inside output_tokens; recorded for analysis, never added to cost.
+    thinking_tokens: int = 0
+    service_tier: str | None = None
 
     # --- tool call (assistant) -----------------------------------------
     tool_use_id: str | None = None
@@ -213,24 +219,53 @@ class TranscriptRecord:
         return self.type == "user" and not self.is_tool_result and not self.is_meta
 
 
-def _usage_tokens(usage: dict[str, Any]) -> tuple[int, int, int, int]:
-    """Token counts from `message.usage`.
+def _int(value: Any) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
 
-    Cache reads and cache creation are returned separately and never summed
-    into input: they price very differently and Phase 3 depends on the split.
+
+def _usage_tokens(usage: dict[str, Any]) -> dict[str, int]:
+    """Token counts from `message.usage`, kept apart by how they price.
+
+    Cache reads and the two cache-write TTLs are returned separately and are
+    never summed into input. Relative to base input they cost roughly 0.1x,
+    1.25x (5m) and 2x (1h), so collapsing any of them makes correct pricing
+    impossible -- which is exactly what the earlier schema did.
+
+    `thinking_tokens` is billed *within* `output_tokens`, so it is reported
+    for analysis and must never be added to a cost sum.
+
+    `iterations` is a per-attempt breakdown that sums to the top level
+    (verified 10,578/10,578 on real data), so the top level is authoritative
+    and retries carry no double-count risk.
     """
-    def n(key: str) -> int:
-        try:
-            return int(usage.get(key) or 0)
-        except (TypeError, ValueError):
-            return 0
+    creation = usage.get("cache_creation")
+    creation = creation if isinstance(creation, dict) else {}
+    details = usage.get("output_tokens_details")
+    details = details if isinstance(details, dict) else {}
 
-    return (
-        n("input_tokens"),
-        n("output_tokens"),
-        n("cache_read_input_tokens"),
-        n("cache_creation_input_tokens"),
-    )
+    total_creation = _int(usage.get("cache_creation_input_tokens"))
+    write_5m = _int(creation.get("ephemeral_5m_input_tokens"))
+    write_1h = _int(creation.get("ephemeral_1h_input_tokens"))
+
+    # The split sums to the total on 12,063/12,063 real records. When the
+    # sub-dict is absent entirely, fall back to charging the whole amount at
+    # the 5m rate: it is the cheaper of the two, so an unknown TTL cannot
+    # silently inflate a cost figure.
+    if not creation and total_creation:
+        write_5m = total_creation
+
+    return {
+        "input_tokens": _int(usage.get("input_tokens")),
+        "output_tokens": _int(usage.get("output_tokens")),
+        "cache_read_tokens": _int(usage.get("cache_read_input_tokens")),
+        "cache_creation_tokens": total_creation,
+        "cache_write_5m_tokens": write_5m,
+        "cache_write_1h_tokens": write_1h,
+        "thinking_tokens": _int(details.get("thinking_tokens")),
+    }
 
 
 def parse_record(raw: dict[str, Any]) -> TranscriptRecord | None:
@@ -268,12 +303,10 @@ def parse_record(raw: dict[str, Any]) -> TranscriptRecord | None:
 
     usage = message.get("usage")
     if isinstance(usage, dict):
-        (
-            rec.input_tokens,
-            rec.output_tokens,
-            rec.cache_read_tokens,
-            rec.cache_creation_tokens,
-        ) = _usage_tokens(usage)
+        for field_name, value in _usage_tokens(usage).items():
+            setattr(rec, field_name, value)
+        tier = usage.get("service_tier")
+        rec.service_tier = tier if isinstance(tier, str) else None
 
     # Measured on the real corpus: exactly one tool_use per assistant record
     # and one tool_result per user record, so first-match is not a shortcut.
@@ -572,6 +605,9 @@ class TreeNode:
     output_tokens: int = 0
     cache_read_tokens: int = 0
     cache_creation_tokens: int = 0
+    cache_write_5m_tokens: int = 0
+    cache_write_1h_tokens: int = 0
+    thinking_tokens: int = 0
     record_count: int = 0
     children: list[TreeNode] = field(default_factory=list)
 
@@ -591,6 +627,12 @@ class SessionTree:
     nodes: list[TreeNode]
     parse_errors: int = 0
     warnings: list[str] = field(default_factory=list)
+    # record uuid -> node_id whose self tokens that record contributed to.
+    # The walk already decides this when it folds a record into a node;
+    # exposing it means Phase 3 can price per record (a node's records can
+    # span models) and can check that every record landed on exactly one
+    # node, which is the attribution invariant.
+    record_scope: dict[str, str] = field(default_factory=dict)
 
     def by_kind(self, kind: str) -> list[TreeNode]:
         return [n for n in self.nodes if n.kind == kind]
@@ -604,8 +646,14 @@ class SessionTree:
         return counts
 
 
-def _accumulate(node: TreeNode, rec: TranscriptRecord) -> None:
+def _accumulate(
+    node: TreeNode,
+    rec: TranscriptRecord,
+    scope: dict[str, str] | None = None,
+) -> None:
     """Fold one record's timing and tokens into its enclosing node."""
+    if scope is not None:
+        scope[rec.uuid] = node.node_id
     if rec.ts_ns:
         node.start_ns = rec.ts_ns if not node.start_ns else min(node.start_ns, rec.ts_ns)
         node.end_ns = max(node.end_ns, rec.ts_ns)
@@ -613,6 +661,9 @@ def _accumulate(node: TreeNode, rec: TranscriptRecord) -> None:
     node.output_tokens += rec.output_tokens
     node.cache_read_tokens += rec.cache_read_tokens
     node.cache_creation_tokens += rec.cache_creation_tokens
+    node.cache_write_5m_tokens += rec.cache_write_5m_tokens
+    node.cache_write_1h_tokens += rec.cache_write_1h_tokens
+    node.thinking_tokens += rec.thinking_tokens
     node.record_count += 1
 
 
@@ -657,6 +708,7 @@ class _TreeBuilder:
         self.tool_nodes: dict[tuple[str | None, str], TreeNode] = {}
         self.claimed: set[str] = set()
         self.warnings: list[str] = []
+        self.record_scope: dict[str, str] = {}
         self.root = self._add(
             TreeNode(
                 node_id=f"session:{session.session_id}",
@@ -692,6 +744,7 @@ class _TreeBuilder:
             nodes=self.nodes,
             parse_errors=self.session.parse_errors,
             warnings=self.warnings,
+            record_scope=self.record_scope,
         )
 
     def _walk(
@@ -722,19 +775,19 @@ class _TreeBuilder:
                         end_ns=rec.ts_ns,
                     ),
                 )
-                _accumulate(current, rec)
+                _accumulate(current, rec, self.record_scope)
                 continue
 
             if rec.type == "assistant" and rec.tool_use_id and not rec.is_tool_result:
                 self._open_tool(rec, current)
-                _accumulate(current, rec)
+                _accumulate(current, rec, self.record_scope)
                 continue
 
             if rec.is_tool_result and rec.tool_use_id:
                 self._close_tool(rec)
                 continue
 
-            _accumulate(current, rec)
+            _accumulate(current, rec, self.record_scope)
 
     def _open_tool(self, rec: TranscriptRecord, scope: TreeNode) -> None:
         node = self._attach(

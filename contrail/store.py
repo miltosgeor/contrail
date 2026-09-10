@@ -9,8 +9,9 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from collections.abc import Iterable, Mapping
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 from .models import Run, Span
 
@@ -105,16 +106,15 @@ CREATE TABLE IF NOT EXISTS transcript_records (
     output_tokens         INTEGER NOT NULL DEFAULT 0,
     cache_read_tokens     INTEGER NOT NULL DEFAULT 0,
     cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
+    cache_write_5m_tokens INTEGER NOT NULL DEFAULT 0,
+    cache_write_1h_tokens INTEGER NOT NULL DEFAULT 0,
+    thinking_tokens       INTEGER NOT NULL DEFAULT 0,
+    service_tier          TEXT,
+    node_id               TEXT,
     text_len              INTEGER NOT NULL DEFAULT 0,
     content               TEXT,
     ingested_at           TEXT NOT NULL DEFAULT (datetime('now'))
 );
-
-CREATE INDEX IF NOT EXISTS idx_tr_session   ON transcript_records(session_id);
-CREATE INDEX IF NOT EXISTS idx_tr_agent     ON transcript_records(agent_id);
-CREATE INDEX IF NOT EXISTS idx_tr_tooluse   ON transcript_records(tool_use_id);
-CREATE INDEX IF NOT EXISTS idx_tr_signature ON transcript_records(tool_signature);
-CREATE INDEX IF NOT EXISTS idx_tr_ts        ON transcript_records(ts_ns);
 
 -- Materialised tree, rebuilt wholesale per session. Same discipline as the
 -- `runs` table: a re-parse after new records land must not be able to leave
@@ -143,13 +143,12 @@ CREATE TABLE IF NOT EXISTS tree_nodes (
     output_tokens         INTEGER NOT NULL DEFAULT 0,
     cache_read_tokens     INTEGER NOT NULL DEFAULT 0,
     cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
+    cache_write_5m_tokens INTEGER NOT NULL DEFAULT 0,
+    cache_write_1h_tokens INTEGER NOT NULL DEFAULT 0,
+    thinking_tokens       INTEGER NOT NULL DEFAULT 0,
     record_count          INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (session_id, node_id)
 );
-
-CREATE INDEX IF NOT EXISTS idx_tn_session ON tree_nodes(session_id);
-CREATE INDEX IF NOT EXISTS idx_tn_parent  ON tree_nodes(parent_node_id);
-CREATE INDEX IF NOT EXISTS idx_tn_kind    ON tree_nodes(kind);
 
 -- One row per parsed session: where it came from and what could not be read.
 CREATE TABLE IF NOT EXISTS transcript_sessions (
@@ -167,12 +166,27 @@ CREATE TABLE IF NOT EXISTS transcript_sessions (
 );
 """
 
+# Indexes are created after _migrate() so that an index can safely
+# reference a column a migration has just added.
+TRANSCRIPT_INDEXES = """
+CREATE INDEX IF NOT EXISTS idx_tr_session   ON transcript_records(session_id);
+CREATE INDEX IF NOT EXISTS idx_tr_agent     ON transcript_records(agent_id);
+CREATE INDEX IF NOT EXISTS idx_tr_tooluse   ON transcript_records(tool_use_id);
+CREATE INDEX IF NOT EXISTS idx_tr_signature ON transcript_records(tool_signature);
+CREATE INDEX IF NOT EXISTS idx_tr_ts        ON transcript_records(ts_ns);
+CREATE INDEX IF NOT EXISTS idx_tn_session ON tree_nodes(session_id);
+CREATE INDEX IF NOT EXISTS idx_tn_parent  ON tree_nodes(parent_node_id);
+CREATE INDEX IF NOT EXISTS idx_tn_kind    ON tree_nodes(kind);
+"""
+
 RECORD_COLUMNS = (
     "uuid", "session_id", "agent_id", "parent_uuid", "type", "timestamp",
     "ts_ns", "is_sidechain", "model", "request_id", "tool_use_id", "tool_name",
     "tool_signature", "is_tool_result", "is_error", "result_status",
     "result_agent_id", "result_run_id", "input_tokens", "output_tokens",
-    "cache_read_tokens", "cache_creation_tokens", "text_len", "content",
+    "cache_read_tokens", "cache_creation_tokens", "cache_write_5m_tokens",
+    "cache_write_1h_tokens", "thinking_tokens", "service_tier", "node_id",
+    "text_len", "content",
 )
 
 NODE_COLUMNS = (
@@ -180,7 +194,8 @@ NODE_COLUMNS = (
     "ordinal", "agent_id", "agent_type", "tool_use_id", "tool_name",
     "tool_signature", "record_uuid", "link_basis", "status", "note",
     "start_ns", "end_ns", "duration_ms", "input_tokens", "output_tokens",
-    "cache_read_tokens", "cache_creation_tokens", "record_count",
+    "cache_read_tokens", "cache_creation_tokens", "cache_write_5m_tokens",
+    "cache_write_1h_tokens", "thinking_tokens", "record_count",
 )
 
 
@@ -195,10 +210,46 @@ class Store:
         self.conn.execute("PRAGMA foreign_keys=ON")
         self.conn.executescript(SCHEMA)
         self.conn.executescript(TRANSCRIPT_SCHEMA)
+        self._migrate()
+        self.conn.executescript(TRANSCRIPT_INDEXES)
         self.conn.commit()
 
     def close(self) -> None:
         self.conn.close()
+
+    # ------------------------------------------------------------- migrate
+
+    # `CREATE TABLE IF NOT EXISTS` will not add a column to a table that
+    # already exists, so a database written by an earlier phase needs the
+    # new columns added explicitly. Additive only: every one is nullable or
+    # defaulted, so an old row stays valid and no data is rewritten.
+    MIGRATIONS: tuple[tuple[str, str, str], ...] = (
+        ("transcript_records", "cache_write_5m_tokens", "INTEGER NOT NULL DEFAULT 0"),
+        ("transcript_records", "cache_write_1h_tokens", "INTEGER NOT NULL DEFAULT 0"),
+        ("transcript_records", "thinking_tokens", "INTEGER NOT NULL DEFAULT 0"),
+        ("transcript_records", "service_tier", "TEXT"),
+        ("transcript_records", "node_id", "TEXT"),
+        ("tree_nodes", "cache_write_5m_tokens", "INTEGER NOT NULL DEFAULT 0"),
+        ("tree_nodes", "cache_write_1h_tokens", "INTEGER NOT NULL DEFAULT 0"),
+        ("tree_nodes", "thinking_tokens", "INTEGER NOT NULL DEFAULT 0"),
+    )
+
+    def _migrate(self) -> int:
+        """Add columns introduced after a database was first created."""
+        added = 0
+        with self.conn:
+            for table, column, decl in self.MIGRATIONS:
+                existing = {
+                    r["name"]
+                    for r in self.conn.execute(f"PRAGMA table_info({table})")
+                }
+                if not existing or column in existing:
+                    continue
+                self.conn.execute(
+                    f"ALTER TABLE {table} ADD COLUMN {column} {decl}"
+                )
+                added += 1
+        return added
 
     # ---------------------------------------------------------------- write
 
@@ -278,7 +329,9 @@ class Store:
 
     # -------------------------------------------------- transcripts (Phase 2)
 
-    def add_transcript_records(self, records: Iterable[Any]) -> int:
+    def add_transcript_records(
+        self, records: Iterable[Any], record_scope: Mapping[str, str] | None = None
+    ) -> int:
         """Upsert transcript records, keyed on `uuid`.
 
         Upserted for the same reason spans are: a session file is appended to
@@ -296,12 +349,17 @@ class Store:
             f"INSERT OR REPLACE INTO transcript_records ({columns}) "
             f"VALUES ({placeholders})"
         )
+        scope = record_scope or {}
         rows = []
         for rec in records:
             row = {c: getattr(rec, c, None) for c in RECORD_COLUMNS}
             row["is_sidechain"] = int(bool(rec.is_sidechain))
             row["is_tool_result"] = int(bool(rec.is_tool_result))
             row["is_error"] = int(bool(rec.is_error))
+            # Persisting which node owns each record means cost can be
+            # attributed straight from the database, without re-walking the
+            # transcripts to rediscover a mapping the tree build already made.
+            row["node_id"] = scope.get(rec.uuid)
             rows.append(row)
 
         with self.conn:
@@ -365,6 +423,36 @@ class Store:
         """A session's nodes in build order, so a caller can rebuild nesting."""
         rows = self.conn.execute(
             "SELECT * FROM tree_nodes WHERE session_id = ? ORDER BY ordinal",
+            (session_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def transcript_records_for(self, session_id: str) -> list[dict[str, Any]]:
+        """Every stored record for a session, in time order.
+
+        Returned as plain rows: cost attribution reads token counts,
+        `model`, `service_tier` and `node_id` off a mapping just as happily
+        as off a dataclass, so nothing needs re-parsing from disk.
+        """
+        rows = self.conn.execute(
+            "SELECT * FROM transcript_records WHERE session_id = ? ORDER BY ts_ns",
+            (session_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def record_scope_for(self, session_id: str) -> dict[str, str]:
+        """The persisted record-uuid -> node-id map for a session."""
+        rows = self.conn.execute(
+            "SELECT uuid, node_id FROM transcript_records "
+            "WHERE session_id = ? AND node_id IS NOT NULL",
+            (session_id,),
+        ).fetchall()
+        return {r["uuid"]: r["node_id"] for r in rows}
+
+    def llm_request_spans_for_session(self, session_id: str) -> list[dict[str, Any]]:
+        """LLM request spans for a session, for the cross-source check."""
+        rows = self.conn.execute(
+            "SELECT * FROM spans WHERE session_id = ? AND name LIKE '%llm_request%'",
             (session_id,),
         ).fetchall()
         return [dict(r) for r in rows]

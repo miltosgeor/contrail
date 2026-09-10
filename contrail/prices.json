@@ -1,0 +1,71 @@
+{
+  "$comment": [
+    "Model prices in USD per million tokens. This is DATA, not constants in",
+    "code: a price change is a new row appended here, never an edit to an",
+    "existing one, so a run recorded in March stays costed at March's prices.",
+    "",
+    "effective_from is the date the figure was CONFIRMED, not the date it",
+    "actually took effect -- we do not know that, and back-dating it would be",
+    "a lie in a file that looks authoritative. A run older than the earliest",
+    "effective_from is reported as unpriced rather than costed at a rate we",
+    "cannot vouch for on that date.",
+    "",
+    "effective_to is null for the currently-effective row. Superseding a row",
+    "means setting its effective_to and appending a new one.",
+    "",
+    "Every row holds the same ratios against its base input price: cache read",
+    "0.1x, 5-minute-TTL cache write 1.25x, 1-hour-TTL cache write 2x, output",
+    "5x. tests/test_cost.py asserts this across the whole table so that a typo",
+    "in a future row fails loudly instead of quietly mispricing runs."
+  ],
+  "prices": [
+    {
+      "model": "claude-opus-5",
+      "service_tier": "standard",
+      "effective_from": "2026-09-10",
+      "effective_to": null,
+      "input_usd_per_mtok": 5.0,
+      "output_usd_per_mtok": 25.0,
+      "cache_read_usd_per_mtok": 0.5,
+      "cache_write_5m_usd_per_mtok": 6.25,
+      "cache_write_1h_usd_per_mtok": 10.0,
+      "source": "https://www.anthropic.com/pricing (fetched 2026-09-10)"
+    },
+    {
+      "model": "claude-opus-4-8",
+      "service_tier": "standard",
+      "effective_from": "2026-09-10",
+      "effective_to": null,
+      "input_usd_per_mtok": 5.0,
+      "output_usd_per_mtok": 25.0,
+      "cache_read_usd_per_mtok": 0.5,
+      "cache_write_5m_usd_per_mtok": 6.25,
+      "cache_write_1h_usd_per_mtok": 10.0,
+      "source": "https://www.anthropic.com/pricing (fetched 2026-09-10)"
+    },
+    {
+      "model": "claude-sonnet-4-6",
+      "service_tier": "standard",
+      "effective_from": "2026-09-10",
+      "effective_to": null,
+      "input_usd_per_mtok": 3.0,
+      "output_usd_per_mtok": 15.0,
+      "cache_read_usd_per_mtok": 0.3,
+      "cache_write_5m_usd_per_mtok": 3.75,
+      "cache_write_1h_usd_per_mtok": 6.0,
+      "source": "https://www.anthropic.com/pricing (fetched 2026-09-10)"
+    },
+    {
+      "model": "claude-haiku-4-5",
+      "service_tier": "standard",
+      "effective_from": "2026-09-10",
+      "effective_to": null,
+      "input_usd_per_mtok": 1.0,
+      "output_usd_per_mtok": 5.0,
+      "cache_read_usd_per_mtok": 0.1,
+      "cache_write_5m_usd_per_mtok": 1.25,
+      "cache_write_1h_usd_per_mtok": 2.0,
+      "source": "https://www.anthropic.com/pricing (fetched 2026-09-10)"
+    }
+  ]
+}

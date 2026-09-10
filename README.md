@@ -14,8 +14,8 @@ actually cost you an afternoon:
 Contrail is the layer that answers those. The dashboard is the front end of a
 data model, not the product. Full reasoning in [`docs/spec.md`](docs/spec.md).
 
-**Status: Phase 2 of 5.** Ingest, store, and subagent tree reconstruction
-work. Cost attribution and the detectors do not exist yet.
+**Status: Phase 3 of 5.** Ingest, store, subagent tree reconstruction and
+cost attribution work. The detectors do not exist yet.
 
 ---
 
@@ -90,6 +90,35 @@ Each subagent node records `link_basis` — which rule linked it to its parent
 a non-reversible normalised signature, never as argument text, unless you opt
 in with `CONTRAIL_CAPTURE_CONTENT=1`.
 
+## Attributing cost
+
+```bash
+contrail cost b2b42db2                 # cost per subagent and per turn
+contrail cost b2b42db2 --at 2026-09-10 # what it would cost at those prices
+contrail reconcile b2b42db2            # check the attribution three ways
+```
+
+```
+session b2b42db2-...
+  priced at 2026-09-10 prices
+  $470.0769  -  541,296,859 billable tokens
+  in 121,090 / out 7,816,998 / cache read 495,676,375 / write 5m 8,610,916 / write 1h 29,071,480
+
+SUBAGENT                                             COST          TOKENS
+Inventory all Python scripts in the projec        $4.2666       3,572,410
+Q1: Why does canonical ordering behave dif        $3.4068       5,083,844
+```
+
+Cost is checked three ways, and only the first is a correctness test: the
+attribution invariant (attributed tokens must equal source tokens), agreement
+between the transcript and OTel paths joined on `request_id`, and agreement
+with Claude Code's own cost counter.
+
+Per-subagent and per-turn cost is measured. **Per-tool cost is not** — a tool
+call makes no API call and has no cost of its own; what it causes is growth in
+the next request's input tokens. Any per-tool figure is a labelled derived
+attribution, never presented as measured.
+
 ## Cost, and what it is not
 
 Tokens are the stored truth. **No dollar figure is written to the database**,
@@ -124,8 +153,11 @@ contrail/
   store.py       SQLite schema and queries
   collector.py   FastAPI app: ingest + read API
   transcript.py  JSONL session parser and subagent tree reconstruction
-  cli.py         serve / runs / show / demo / parse / sessions / tree
-tests/           110 tests, no network, nothing written outside tmp_path
+  cost.py        dated price lookup, cost attribution, reconciliation
+  prices.json    the price table -- data with effective dates, not code
+  cli.py         serve / runs / show / demo / parse / sessions / tree /
+                 cost / reconcile
+tests/           161 tests, no network, nothing written outside tmp_path
 docs/spec.md     Why this exists and what the remaining phases are
 ```
 
@@ -146,8 +178,8 @@ one line, not migrating a database.
 | --- | --- | --- |
 | 1 | Ingest and store | done |
 | 2 | Subagent tree reconstruction | done |
-| 3 | Cost attribution per node | next |
-| 4 | Loop, divergence and silent-failure detectors | |
+| 3 | Cost attribution per node | done |
+| 4 | Loop, divergence and silent-failure detectors | next |
 | 5 | The screen | |
 
 ## Development

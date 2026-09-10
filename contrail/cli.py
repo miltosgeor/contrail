@@ -8,6 +8,8 @@
     contrail parse                 read session transcripts from disk
     contrail sessions              list parsed sessions
     contrail tree <session_id>     print one reconstructed run tree
+    contrail cost <session_id>     attribute cost across the run tree
+    contrail reconcile <session>   check the attribution three ways
 
 The two groups are separate paths on purpose: `parse`/`sessions`/`tree` read
 the JSONL Claude Code already writes and need no collector and no telemetry
@@ -21,6 +23,7 @@ import json
 import os
 import sys
 from pathlib import Path
+from typing import Any
 
 from .store import Store
 from .transcript import KIND_SUBAGENT, KIND_TOOL
@@ -158,9 +161,9 @@ def cmd_parse(args: argparse.Namespace) -> int:
         session = load_session(path)
         tree = build_tree(session)
 
-        records = store.add_transcript_records(session.records)
+        records = store.add_transcript_records(session.records, tree.record_scope)
         for agent in session.agents.values():
-            records += store.add_transcript_records(agent.records)
+            records += store.add_transcript_records(agent.records, tree.record_scope)
         nodes = store.save_tree(
             tree, project_slug=session.project_slug, path=str(path)
         )
@@ -280,6 +283,166 @@ def cmd_tree(args: argparse.Namespace) -> int:
     return 0
 
 
+
+def _usd(value: float | None) -> str:
+    """Format money, or say plainly that we could not price it.
+
+    An unpriced run must never render as $0.00 -- free and unpriced are
+    different facts.
+    """
+    return "unpriced" if value is None else f"${value:,.4f}"
+
+
+def _resolve_session(store: Store, prefix: str) -> dict[str, Any] | None:
+    matches = [
+        r for r in store.transcript_sessions(limit=500)
+        if r["session_id"].startswith(prefix)
+    ]
+    return matches[0] if matches else None
+
+
+def _load_run_cost(store: Store, session_id: str, priced_at):
+    from .cost import PriceTable, attribute_cost
+
+    nodes = store.tree_nodes(session_id)
+    records = store.transcript_records_for(session_id)
+    scope = store.record_scope_for(session_id)
+    run = attribute_cost(
+        nodes, records, scope, PriceTable(), priced_at, session_id
+    )
+    return run, nodes, records, scope
+
+
+def _priced_at(args: argparse.Namespace, row: dict[str, Any]):
+    """The date to price a run at.
+
+    Defaults to the run's own start time, not today: a run from March is
+    costed at March's prices, which is the entire reason the price table is
+    dated. `--at` overrides it for asking what a past run would cost now.
+    """
+    from datetime import date, datetime, timezone
+
+    if getattr(args, "at", None):
+        return date.fromisoformat(args.at)
+    start_ns = row.get("start_ns") or 0
+    if start_ns:
+        return datetime.fromtimestamp(start_ns / 1e9, tz=timezone.utc).date()
+    # No usable start time: fall back to today in UTC, and say so, because
+    # the price date silently changing the figure would be worse.
+    print("  (run has no start time; pricing at today's UTC date)", file=sys.stderr)
+    return datetime.now(tz=timezone.utc).date()
+
+
+def cmd_cost(args: argparse.Namespace) -> int:
+    """Attribute cost across one session's tree."""
+    store = Store(args.db)
+    row = _resolve_session(store, args.session)
+    if row is None:
+        print(f"no parsed session matching {args.session!r}", file=sys.stderr)
+        print("try: contrail parse", file=sys.stderr)
+        return 1
+
+    priced_at = _priced_at(args, row)
+    run, nodes, _records, _scope = _load_run_cost(store, row["session_id"], priced_at)
+    if not nodes:
+        print("session has no stored tree -- try: contrail parse", file=sys.stderr)
+        return 1
+
+    tokens = run.total_tokens
+    print(f"session {row['session_id']}  [{row['project_slug']}]")
+    print(f"  priced at {priced_at.isoformat()} prices")
+    print(f"  {_usd(run.total_usd)}  -  {tokens.billable_total:,} billable tokens")
+    print(
+        f"  in {tokens.input:,} / out {tokens.output:,} / "
+        f"cache read {tokens.cache_read:,} / "
+        f"write 5m {tokens.cache_write_5m:,} / write 1h {tokens.cache_write_1h:,}"
+    )
+    if tokens.thinking:
+        print(f"  thinking {tokens.thinking:,} (billed inside output, not added)")
+    for warning in run.warnings:
+        print(f"  ! {warning}")
+    if run.unpriced_records:
+        print(f"  ! unpriced_records: {run.unpriced_records} -- the figure above is a floor")
+    print()
+
+    subagents = [n for n in run.by_kind("subagent") if n.total_tokens.billable_total]
+    if subagents:
+        print(f"{'SUBAGENT':<44}{'COST':>13}{'TOKENS':>16}")
+        for cost in subagents[: args.limit]:
+            print(
+                f"{cost.label[:42]:<44}{_usd(cost.total_usd):>13}"
+                f"{cost.total_tokens.billable_total:>16,}"
+            )
+        if len(subagents) > args.limit:
+            print(f"... and {len(subagents) - args.limit} more, raise --limit")
+        print()
+
+    turns = [n for n in run.by_kind("turn") if n.total_tokens.billable_total]
+    if turns:
+        print(f"{'TURN':<44}{'COST':>13}{'SELF':>13}")
+        for cost in turns[: args.limit]:
+            print(
+                f"{cost.label[:42]:<44}{_usd(cost.total_usd):>13}"
+                f"{_usd(cost.self_usd):>13}"
+            )
+        if len(turns) > args.limit:
+            print(f"... and {len(turns) - args.limit} more, raise --limit")
+    return 0
+
+
+def cmd_reconcile(args: argparse.Namespace) -> int:
+    """Run the three reconciliation layers over one session.
+
+    Each layer prints what it proves, because they prove different things and
+    only the first is a correctness test.
+    """
+    from .cost import (
+        check_against_counter,
+        check_attribution_invariant,
+        check_cross_source,
+    )
+
+    store = Store(args.db)
+    row = _resolve_session(store, args.session)
+    if row is None:
+        print(f"no parsed session matching {args.session!r}", file=sys.stderr)
+        return 1
+
+    priced_at = _priced_at(args, row)
+    run, _nodes, records, scope = _load_run_cost(store, row["session_id"], priced_at)
+    spans = store.llm_request_spans_for_session(row["session_id"])
+
+    results = [
+        check_attribution_invariant(run, records, scope),
+        check_cross_source(records, spans),
+    ]
+    if args.counter:
+        counter = json.loads(Path(args.counter).read_text(encoding="utf-8"))
+        results.append(check_against_counter(run, counter, args.tolerance))
+
+    print(f"session {row['session_id']}  priced at {priced_at.isoformat()}")
+    print(f"computed {_usd(run.total_usd)}\n")
+
+    failed = 0
+    for i, result in enumerate(results, start=1):
+        mark = "PASS" if result.ok else "FAIL"
+        failed += not result.ok
+        print(f"Layer {i} -- {result.layer}: {mark}")
+        print(f"  proves: {result.proves}")
+        for key, value in result.detail.items():
+            print(f"    {key}: {value}")
+        for note in result.notes:
+            print(f"    note: {note}")
+        print()
+
+    if not args.counter:
+        print("Layer 3 skipped: pass --counter with a JSON {model: usd} export of")
+        print("claude_code.cost.usage. Note that counter is Claude Code's own")
+        print("client-side estimate, not a billing figure.")
+    # Only Layer 1 is a correctness test; a Layer 2/3 miss is information.
+    return 1 if not results[0].ok else 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="contrail", description=__doc__)
     parser.add_argument("--db", default=os.environ.get("CONTRAIL_DB", "contrail.db"))
@@ -318,6 +481,19 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--depth", type=int, default=3)
     p.add_argument("--max-warnings", type=int, default=5)
     p.set_defaults(func=cmd_tree)
+
+    p = sub.add_parser("cost", help="attribute cost across one run tree")
+    p.add_argument("session", help="full or partial session id")
+    p.add_argument("--at", help="price at this ISO date instead of the run's own")
+    p.add_argument("--limit", type=int, default=15)
+    p.set_defaults(func=cmd_cost)
+
+    p = sub.add_parser("reconcile", help="run the three reconciliation layers")
+    p.add_argument("session", help="full or partial session id")
+    p.add_argument("--at", help="price at this ISO date instead of the run's own")
+    p.add_argument("--counter", help="JSON {model: usd} from claude_code.cost.usage")
+    p.add_argument("--tolerance", type=float, default=0.02)
+    p.set_defaults(func=cmd_reconcile)
 
     args = parser.parse_args(argv)
     return args.func(args)

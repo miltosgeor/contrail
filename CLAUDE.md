@@ -16,16 +16,18 @@ change.
 
 ## Current state
 
-Phases 1-2 complete. 110 tests pass. Phase 2 was verified against a real
-Claude Code data directory: 5 sessions and 148 subagent transcripts
-reconstruct with zero orphans and zero unreadable lines.
+Phases 1-3 complete. 161 tests pass. Phase 3 was verified against real data:
+the attribution invariant holds exactly (94,086,758 tokens attributed ==
+94,086,758 in the source), transcript and span tokens agree on 154 of 154
+matched calls, and our computed cost matched Claude Code's own cost counter to
+six decimal places on a captured run.
 
 | Phase | | Status |
 | --- | --- | --- |
 | 1 | Ingest and store | done |
 | 2 | Subagent tree reconstruction | done |
-| 3 | Cost attribution per node | next |
-| 4 | Loop / divergence / silent-failure detectors | |
+| 3 | Cost attribution per node | done |
+| 4 | Loop / divergence / silent-failure detectors | next |
 | 5 | The screen | |
 
 **Phase order is a constraint, not a suggestion.** Phases 2–4 are the reason
@@ -42,7 +44,10 @@ contrail/
   store.py       SQLite schema and queries
   collector.py   FastAPI app: OTLP ingest + JSON read API
   transcript.py  JSONL session parser and subagent tree reconstruction
-  cli.py         serve / runs / show / demo / parse / sessions / tree
+  cost.py        dated price lookup, cost attribution, reconciliation
+  prices.json    the price table -- data with effective dates, not code
+  cli.py         serve / runs / show / demo / parse / sessions / tree /
+                 cost / reconcile
 tests/           mirrors the module names, one file each
 docs/spec.md     why this exists, the three gaps, the phase plan
 ```
@@ -125,6 +130,40 @@ becomes a `missing_transcript` node, an unanswered tool call stays
 `incomplete`, an async workflow stays `pending`, and unreadable lines are
 counted. A tree that admits a gap is useful; one that silently omits it is
 a lie.
+
+## Conventions established by Phase 3 -- keep these
+
+**Tokens are the stored truth. No dollar figure is ever persisted.** Cost is
+computed at query time from `prices.json`, whose rows carry effective dates,
+so a run from March stays costed at March's prices. There is a test that
+walks the whole database schema and fails on any column named like a price.
+
+**A price row is appended, never edited.** Set the old row's `effective_to`
+and add a new one. `effective_from` is the date the figure was *confirmed*,
+never an earlier date we would be guessing at -- which does mean a run
+predating the earliest confirmed price reports as unpriced, and that is the
+honest answer rather than a bug. `--at` exists for asking what an old run
+would cost at today's prices.
+
+**Unpriced is not free.** An unknown model yields None plus a reported
+`unpriced_records` count. `<synthetic>` is excluded from cost entirely rather
+than priced at zero. Rendering an unpriced run as $0.00 is the exact failure
+mode the `ALIASES` bug already demonstrated.
+
+**Thinking tokens are stored but never summed.** They are billed inside
+`output_tokens`; adding them double-charges.
+
+**Cost comes from transcripts, timing from OTel.** `llm_request` spans carry
+no `tool_use_id` and no agent identity, so they cannot say which subagent
+spent what. The two paths join on `request_id` / `requestId`, and that join
+is used for *verification*, not attribution.
+
+**Reconciliation is three layers and only the first is a correctness test.**
+The attribution invariant is arithmetic and must always hold. Cross-source
+agreement is independent evidence. Agreement with `claude_code.cost.usage`
+checks our price table against the one bundled in the CLI -- that counter is
+a client-side estimate, not a billing figure, and must never be called ground
+truth.
 
 ## Working notes for Phase 2 -- done, kept for context
 
