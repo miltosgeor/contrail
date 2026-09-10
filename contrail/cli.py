@@ -85,8 +85,8 @@ def cmd_show(args: argparse.Namespace) -> int:
     errors = run["error_count"]
     print(f"{run['root_name']}  [{trace_id[:16]}]")
     print(
-        f"  {_fmt_ms(run['duration_ms'])} · {run['span_count']} spans · "
-        f"{errors} error{'' if errors == 1 else 's'} · "
+        f"  {_fmt_ms(run['duration_ms'])} - {run['span_count']} spans - "
+        f"{errors} error{'' if errors == 1 else 's'} - "
         f"{run['input_tokens']:,} in / {run['output_tokens']:,} out "
         f"({run['cache_read_tokens']:,} cached)\n"
     )
@@ -103,10 +103,10 @@ def cmd_show(args: argparse.Namespace) -> int:
             last = i == len(kids) - 1
             label = f"{s.name} {s.tool_name}" if s.tool_name else s.name
             flag = "  ERROR" if s.is_error else ""
-            branch = f"{prefix}{'└─ ' if last else '├─ '}" if prefix or parent else ""
+            branch = f"{prefix}{'`- ' if last else '|- '}" if prefix or parent else ""
             print(f"{branch}{label:<{max(10, 46 - len(branch))}}"
                   f"{_fmt_ms(s.duration_ms):>9}{flag}")
-            walk(s.span_id, prefix + ("   " if last else "│  ") if branch else "")
+            walk(s.span_id, prefix + ("   " if last else "|  ") if branch else "")
 
     walk(None, "")
     return 0
@@ -245,7 +245,7 @@ def cmd_tree(args: argparse.Namespace) -> int:
     print(
         f"  {row['node_count']:,} nodes - {row['agent_count']} subagents - "
         f"{tokens:,} tokens"
-        + (f" · {row['parse_errors']} unreadable lines" if row["parse_errors"] else "")
+        + (f" - {row['parse_errors']} unreadable lines" if row["parse_errors"] else "")
     )
     warnings = json.loads(row["warnings"] or "[]")
     for warning in warnings[: args.max_warnings]:
@@ -533,7 +533,27 @@ def cmd_findings(args: argparse.Namespace) -> int:
     return 0
 
 
+def _make_stdout_safe() -> None:
+    """Never let an unencodable character crash the CLI.
+
+    The target environment is Windows PowerShell, whose console codepage is
+    cp1252 and cannot encode box-drawing characters or a middot. Printing one
+    raises UnicodeEncodeError and takes the command down -- which is exactly
+    how `contrail show` failed on a clean install. Output glyphs are ASCII for
+    that reason; this is the belt to that braces.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            reconfigure(errors="replace")
+        except (ValueError, OSError):  # a stream that cannot be reconfigured
+            pass
+
+
 def main(argv: list[str] | None = None) -> int:
+    _make_stdout_safe()
     parser = argparse.ArgumentParser(prog="contrail", description=__doc__)
     parser.add_argument("--db", default=os.environ.get("CONTRAIL_DB", "contrail.db"))
     sub = parser.add_subparsers(dest="command", required=True)
