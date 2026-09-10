@@ -38,12 +38,17 @@ def cmd_serve(args: argparse.Namespace) -> int:
     import uvicorn
 
     os.environ.setdefault("CONTRAIL_DB", args.db)
-    print(f"contrail -> {args.db}")
-    print(f"  screen         http://{args.host}:{args.port}/")
-    print(f"  OTLP ingest    http://{args.host}:{args.port}/v1/traces")
-    print()
-    print("The screen reads transcripts and needs no telemetry. If it is")
-    print("empty, run: contrail parse")
+    # Flushed explicitly: stdout is block-buffered when it is not a tty, so
+    # without this the lines telling you where to go arrive after uvicorn's
+    # own logging rather than before it.
+    print(f"contrail -> {args.db}", flush=True)
+    print(f"  screen         http://{args.host}:{args.port}/", flush=True)
+    print(f"  OTLP ingest    http://{args.host}:{args.port}/v1/traces", flush=True)
+    print(
+        "\nThe screen reads transcripts and needs no telemetry."
+        " If it is empty, run: contrail parse\n",
+        flush=True,
+    )
     uvicorn.run(
         "contrail.collector:app", host=args.host, port=args.port, reload=args.reload
     )
