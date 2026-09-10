@@ -20,6 +20,14 @@ NS_PER_MS = 1_000_000
 # Attribute aliases, most-preferred first. OpenInference names come first
 # because they are the more stable of the two conventions today; the OTel
 # gen_ai.* names are still not stable as of 2026.
+#
+# The bare names (`input_tokens`, `tool_name`, ...) come last but are not
+# optional: they are what Claude Code actually emits today, and for the token
+# counts they are the *only* names present on a real span. Verified against
+# live export at service.version 2.1.266 -- without them every token count on
+# a real span reads zero, which is silent and would have surfaced as Phase 3
+# costing every run at $0. They rank last so that an explicit convention
+# attribute still wins if one is ever emitted alongside.
 ALIASES: dict[str, tuple[str, ...]] = {
     "session_id": (
         "session.id",
@@ -36,6 +44,7 @@ ALIASES: dict[str, tuple[str, ...]] = {
         "tool.name",
         "gen_ai.tool.name",
         "claude_code.tool.name",
+        "tool_name",
     ),
     "agent_type": (
         "agent.name",
@@ -45,18 +54,22 @@ ALIASES: dict[str, tuple[str, ...]] = {
     "input_tokens": (
         "llm.token_count.prompt",
         "gen_ai.usage.input_tokens",
+        "input_tokens",
     ),
     "output_tokens": (
         "llm.token_count.completion",
         "gen_ai.usage.output_tokens",
+        "output_tokens",
     ),
     "cache_read_tokens": (
         "gen_ai.usage.cache_read_input_tokens",
         "llm.token_count.cache_read",
+        "cache_read_tokens",
     ),
     "cache_creation_tokens": (
         "gen_ai.usage.cache_creation_input_tokens",
         "llm.token_count.cache_write",
+        "cache_creation_tokens",
     ),
 }
 

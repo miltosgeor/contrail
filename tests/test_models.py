@@ -84,3 +84,70 @@ def test_run_aggregates_tokens_and_span_extent():
     run = Run.from_spans(spans)
     assert run.input_tokens == 15
     assert run.duration_ms == 400
+
+
+# --- Regression: the attribute names Claude Code actually emits ----------
+#
+# Phase 1 was verified against a real protobuf payload, which proved the
+# transport but not the extraction. The fixtures above use OpenInference and
+# gen_ai.* names; real spans emit bare names, and for token counts the bare
+# name is the only one present. The result was a silent zero on every real
+# span -- see docs/spec.md, "Trace-side join keys".
+
+# Copied from a live export at service.version 2.1.266, identity attributes
+# and resource noise removed.
+REAL_LLM_REQUEST = {
+    "session.id": "cec62d6f-60f8-43e8-a67b-133b2a138a83",
+    "span.type": "llm_request",
+    "model": "claude-opus-5",
+    "gen_ai.system": "anthropic",
+    "gen_ai.request.model": "claude-opus-5",
+    "input_tokens": 2,
+    "output_tokens": 1200,
+    "cache_read_tokens": 84562,
+    "cache_creation_tokens": 7096,
+    "success": True,
+    "stop_reason": "tool_use",
+}
+
+REAL_TOOL = {
+    "session.id": "cec62d6f-60f8-43e8-a67b-133b2a138a83",
+    "span.type": "tool",
+    "tool_name": "Bash",
+    "tool_use_id": "toolu_01FtRNK8XRAQVMTwbVegwQFv",
+    "gen_ai.tool.call.id": "toolu_01FtRNK8XRAQVMTwbVegwQFv",
+    "duration_ms": 1831,
+}
+
+
+def test_real_span_token_counts_are_not_silently_zero():
+    s = span("a", name="claude_code.llm_request", **REAL_LLM_REQUEST)
+    assert s.input_tokens == 2
+    assert s.output_tokens == 1200
+    assert s.cache_read_tokens == 84562
+    assert s.cache_creation_tokens == 7096
+
+
+def test_real_span_cache_tokens_stay_separate_from_input():
+    """Cache reads price ~10% of input; summing them would hide the split."""
+    s = span("a", name="claude_code.llm_request", **REAL_LLM_REQUEST)
+    assert s.input_tokens == 2, "cache tokens must not be folded into input"
+    assert s.cache_read_tokens != s.cache_creation_tokens
+
+
+def test_real_tool_span_resolves_tool_name():
+    s = span("a", name="claude_code.tool", **REAL_TOOL)
+    assert s.tool_name == "Bash"
+
+
+def test_real_span_resolves_session_id():
+    s = span("a", name="claude_code.tool", **REAL_TOOL)
+    assert s.session_id == "cec62d6f-60f8-43e8-a67b-133b2a138a83"
+
+
+def test_explicit_convention_still_beats_the_bare_name():
+    """Bare names rank last, so a real convention attribute keeps priority."""
+    s = span("a", **{"gen_ai.usage.input_tokens": 99, "input_tokens": 1})
+    assert s.input_tokens == 99
+    s = span("b", **{"tool.name": "Read", "tool_name": "Bash"})
+    assert s.tool_name == "Read"
