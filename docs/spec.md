@@ -533,6 +533,78 @@ each one saves a week.
 - **Not a prompt playground.** No editing, no replay-with-changes. Read-only over runs that already happened.
 - **Not real-time streaming at first.** Runs appear when they finish. Live tailing is a Phase 6 nice-to-have.
 
+## Corrections
+
+What this project got wrong, what each error cost, and how it was found. Kept
+because the pattern across them is the most useful thing here: **every one
+produced silently wrong output rather than a crash**, and that is the entire
+argument for the canary convention in `CLAUDE.md`.
+
+Two other records belong beside this: the *documented negative result* under
+Gap 3, where a planned detector was tested against real data and dropped, and
+the corrections to this spec's own description of the transcript format and of
+cost attribution, recorded in place in those sections.
+
+### Spec errors — things this document asserted that were not true
+
+| Claimed | Actually | Found by |
+| --- | --- | --- |
+| The DAG edge is `parent_message_id` | `uuid` / `parentUuid`; no such field exists | reading a real transcript before writing the parser |
+| Subagent work is inline in the parent transcript | one separate file per subagent, `isSidechain: true`, parent's `sessionId` | same |
+| Join subagents on `tool_use_id` | finds 15% of the tree — only 22 of 148 sidecars carry it | counting them |
+| `SubagentStart`/`SubagentStop` hooks are needed | transcripts are self-sufficient; the hook shim was dropped entirely | same |
+| Reconcile cost against `ResultMessage.total_cost_usd` | SDK streaming state, absent from disk — zero structured cost fields in 148 transcripts | searching for it |
+| Per-tool cost is measurable | a tool call makes no API call; only derivable as an attribution | thinking about what a tool call is |
+| Cache writes cost ~125% of input | true of the 5-minute TTL only; the 1-hour TTL is ~2x, and both occur heavily (1h on 9,879 records, 5m on 2,104) | reading `message.usage.cache_creation` |
+| Run-vs-run diff compares execution paths | path divergence does not predict outcome divergence — see the negative result | measuring it across 25 verifier triples |
+
+The pattern: every one came from describing a format or a capability from
+documentation rather than from the artefact. Reading one real file first would
+have caught all of them, which is why *Transcript format, as verified* exists
+and why `CLAUDE.md` says to trust it over any community documentation.
+
+### Implementation errors — silently wrong output
+
+| Bug | What it produced | Why nothing complained |
+| --- | --- | --- |
+| `ALIASES` missing the attribute names Claude Code actually emits | every real span stored `tool_name` NULL and all four token counts 0 | the attributes were present, just never looked for; Phase 3 would have costed every run at $0 |
+| Subagent records folded into their node twice | every subagent's cost doubled | arithmetic, no error path |
+| `result_hash` read off the `tool_use` record instead of the `tool_result` record | the repeat detector found nothing and reported every group undecidable | a detector finding nothing looks the same as a clean run |
+| `toolUseResult` hashed only when a dict | every *failed* call looked like it had no result at all; 11 of 22 groups spuriously undecidable | it is a dict on success and a plain string on error |
+| A node id built from `tool_use_id` alone | ids collided across agent files, creating a parent cycle that hung the tree walk | a hang, not a wrong answer — the one exception to the pattern |
+| A run whose every record was unpriced | totalled `$0.00`, because the session node had no tokens of its own and counted as "genuinely free" | free and unpriced rendered identically |
+| `contrail show` printing box-drawing characters | `UnicodeEncodeError` on a clean Windows install — step three of the README quick start | the dev shell happened to be UTF-8 |
+| The `serve` banner not flushed | the one message telling a first-time user where to go arrived after uvicorn's logging | stdout is block-buffered when not a tty |
+
+Two of those were found only by a **clean-clone smoke test** — fresh clone,
+fresh virtualenv, no cached dependencies and no existing database. An editable
+install with a warm cache exercises none of the path a stranger takes.
+
+### Detector rules that were wrong first time
+
+**"Was there an intervening write to the same target?"** — the first
+redundant-repeat rule. Wrong on **8 of the 9** cases it flagged, because files
+are also rewritten by background processes and by shell commands that leave no
+write in the trace. Replaced by comparing result hashes, which is right about
+redundancy whatever caused it. That took the labelled set from 1 decided of 22
+to 21 of 22.
+
+**Share alone as cost concentration.** Produced 11 findings on one session, of
+which 7 were two-sibling workflows whose "dominant" child was only 1.01x to
+1.91x its single sibling. One of two children holding half the parent is
+arithmetic, not insight, and the noise buried the findings that meant
+something. Now also requires enough siblings for "typical" to mean anything
+and a multiple of the sibling median: 11 findings became 3. Found by building
+the screen — the verdict-first layout made the noise obvious in a way the CLI
+never did.
+
+**Reporting every unhandled error.** Precision was 3 of 14 hand-labelled
+findings, dominated by two classes where continuing is correct behaviour: a
+tool the user declined, and a probe for a file that does not exist. Excluding
+those by their harness error template took precision to **3 of 4** — on a
+sample of four, which is why the detector is still marked low confidence
+rather than declared fixed.
+
 ## Honest risks
 
 **The beta flag moves.** Trace export is behind a beta flag and span names can
