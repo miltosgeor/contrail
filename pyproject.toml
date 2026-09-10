@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "A trace store and analysis layer for Claude agent runs."
 readme = "README.md"
 requires-python = ">=3.10"
-license = { text = "MIT" }
+license = { file = "LICENSE" }
 authors = [{ name = "Miltiades Georgantzis" }]
 keywords = ["observability", "opentelemetry", "llm-agents", "claude"]
 

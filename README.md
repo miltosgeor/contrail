@@ -2,28 +2,32 @@
 
 A trace store and analysis layer for Claude agent runs.
 
+![The Contrail screen: a session list led by findings and tokens, a findings panel, a cost-proportional strip across 342 turns, and a collapsed tree](docs/screenshot.png)
+
+Real data — six of the author's own Claude Code sessions, including the one
+that built Contrail (`cec62d6f`, clean).
+
 Claude Code already exports OpenTelemetry traces. What it doesn't do — and
 what no agent observability tool does well yet — is answer the questions that
 actually cost you an afternoon:
 
-- Where did this agent **loop**, and on what?
-- Which **subagent** burned the budget?
-- Did a tool call fail and the agent carry on regardless?
-- When the same task runs twice, **where do the runs diverge**?
+- Where did this agent **repeat work** that changed nothing?
+- Which **subagent** burned the budget, and how far above its siblings?
+- Did a tool call **fail** and nothing afterwards touch what it was for?
+- What did this session **cost**, at the prices in force when it ran?
 
-Contrail is the layer that answers those. The dashboard is the front end of a
-data model, not the product. Full reasoning in [`docs/spec.md`](docs/spec.md).
+Contrail answers those. The screen opens on **findings and cost**, not on a
+list of traces: every agent observability tool opens on traces, and opening
+there would make this one of them. The tree is where you drill for evidence,
+reachable only from a finding or a cost bar.
+
+It is a data project with a UI, not the other way round — the screen is one
+static file with no build step, and it came last on purpose. Full reasoning
+in [`docs/spec.md`](docs/spec.md), including
+[a detector we tested and dropped](#a-negative-result-we-kept).
 
 **Status: all five phases complete.** Ingest, store, subagent tree
 reconstruction, cost attribution, the detectors, and the screen.
-
-![Contrail](docs/screenshot.png)
-
-Real data — six of the author's own Claude Code sessions, including the one
-that built Contrail (`cec62d6f`, clean). The screen opens on **findings and
-cost**, not on a list of traces: every agent observability tool opens on
-traces, and opening there would make this one of them. The tree is where you
-drill for evidence, reachable only from a finding or a cost bar.
 
 ---
 
@@ -296,4 +300,4 @@ ruff check .
 
 ## License
 
-MIT
+MIT — see [LICENSE](LICENSE).
