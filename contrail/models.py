@@ -12,7 +12,7 @@ store stable when a schema shifts underneath us -- see docs/spec.md.
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field, asdict
+from dataclasses import asdict, dataclass, field
 from typing import Any
 
 NS_PER_MS = 1_000_000
@@ -174,7 +174,7 @@ class Run:
         return max(0.0, (self.end_ns - self.start_ns) / NS_PER_MS)
 
     @classmethod
-    def from_spans(cls, spans: list[Span]) -> "Run":
+    def from_spans(cls, spans: list[Span]) -> Run:
         if not spans:
             raise ValueError("cannot build a Run from zero spans")
 

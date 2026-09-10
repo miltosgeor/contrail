@@ -51,7 +51,7 @@ def _hex_id(raw: Any) -> str:
         pass
     try:
         return base64.b64decode(text + "=" * (-len(text) % 4)).hex()
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         raise OtlpDecodeError(f"unrecognised id encoding: {raw!r}") from exc
 
 
@@ -146,7 +146,7 @@ def decode_protobuf(data: bytes) -> list[Span]:
     request = ExportTraceServiceRequest()
     try:
         request.ParseFromString(data)
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         raise OtlpDecodeError(f"could not parse protobuf body: {exc}") from exc
 
     spans: list[Span] = []

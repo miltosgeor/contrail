@@ -7,7 +7,7 @@ from fastapi.testclient import TestClient
 @pytest.fixture
 def client(tmp_path, monkeypatch):
     monkeypatch.setenv("CONTRAIL_DB", str(tmp_path / "test.db"))
-    import contrail.collector as collector
+    from contrail import collector
 
     importlib.reload(collector)
     return TestClient(collector.app)
