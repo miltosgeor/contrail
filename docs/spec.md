@@ -97,14 +97,98 @@ at March's prices.
 *Output: "this run cost $2.40, and $1.90 of it was one Explore subagent
 re-reading the same files."*
 
-### Gap 3 — Loop, divergence and silent failure
+### Gap 3 — Redundancy, cost concentration, divergence, unhandled errors
 
-Hash tool-call signatures to catch repeated state. Diff two runs of the same
-task to find where they split. Flag `is_error` tool results the agent never
-acknowledged in the following message.
+Four detectors, revised after measuring the corpus rather than assuming what
+would be in it. One of the originally planned three was dropped on evidence —
+see *Divergence: a documented negative result* below.
 
-*Output: three detectors that fire on real runs. The hardest and most
-interesting part — do it last, but do it.*
+**Redundant repeats.** Hash tool-call signatures to find calls repeated within
+one node, then split them on whether the *result* changed. Identical result
+hash means the repeat genuinely gained nothing, whatever caused it; a
+different hash means something changed, whether or not any write appears in
+the trace. Repeated writes take a separate rule, since an identical edit
+applied twice should fail the second time.
+
+**Cost concentration.** Flag nodes consuming disproportionate tokens relative
+to their siblings. Needs no ground truth beyond arithmetic over the Phase 3
+attribution, and it is what actually answers "why did this run cost so much".
+
+**Outcome divergence.** Compare the structured outputs of sibling agents given
+the same task. Requires structured, comparable outputs and does not
+generalise to arbitrary runs — stated plainly because the corpus only
+supports it under that precondition.
+
+**Unhandled errors.** Report `is_error` tool results where nothing
+subsequently touched the same target. Deliberately framed as description, not
+verdict: some errors are informative and moving on is correct behaviour, so
+this reports a shape, never that the agent was wrong to continue. A
+structural proxy, and labelled as one.
+
+*Output: four detectors as pure functions over a run tree, each carrying the
+evidence for its finding.*
+
+### Divergence: a documented negative result
+
+The original plan had a detector that diffs two runs of the same task to find
+where they split, on the assumption that execution-path divergence is what
+you want to see. **That assumption was tested against real data and does not
+hold.** The finding is recorded here rather than quietly dropped, because a
+negative result that changes the design is worth as much as a positive one.
+
+The corpus contains a natural experiment. A `deep-research` workflow
+dispatched adversarial claim verifiers under a "≥2/3 refutations kill it"
+voting scheme, which sends the same claim to three independent agents:
+**25 tasks, each run exactly three times, 75 agents.** Three of the 25 split
+on outcome — same input, different verdict — and 22 agreed. So there are
+labelled positives and negatives from a real run.
+
+Mean pairwise path distance within a triple, over the sequence of
+`(tool, normalised-argument-signature)` pairs:
+
+| | n | mean | range |
+| --- | --- | --- | --- |
+| Split on outcome | 3 | 0.878 | 0.823 – 0.944 |
+| Agreed | 22 | 0.839 | 0.738 – 0.961 |
+
+The ranges overlap almost entirely, and the **most** path-divergent triple in
+the corpus is one that *agreed* (0.961). Comparing tool names only, ignoring
+arguments, gives 0.199 against 0.123 — directionally the same, and at n=3 the
+gap is noise either way.
+
+Two counter-examples, one in each direction. A triple that split on outcome
+while running effectively the same path:
+
+```
+refuted=False   ToolSearch WebFetch WebSearch WebSearch WebSearch StructuredOutput
+refuted=True    ToolSearch WebFetch WebSearch WebFetch  WebSearch StructuredOutput
+refuted=False   ToolSearch WebFetch WebSearch WebSearch WebSearch StructuredOutput
+```
+
+And the most path-divergent triple, which agreed despite genuinely different
+strategies — one member searching the web, two shelling out:
+
+```
+refuted=False   ToolSearch WebFetch WebSearch WebFetch WebSearch WebFetch StructuredOutput
+refuted=False   ToolSearch WebFetch Bash Bash Bash Bash Bash Bash StructuredOutput
+refuted=False   ToolSearch WebFetch Bash Bash Bash Bash Bash StructuredOutput
+```
+
+The metric is also **saturated**: every verifier is a web agent whose
+`WebSearch` queries and `WebFetch` URLs are unique, so signatures almost
+never match and the distance is pinned near 0.85 in both groups. A measure
+that cannot separate its own control group has no discriminating power here.
+
+**Consequences, and they are the point of writing this down.**
+
+- Path-diff divergence is dropped. It is not merely unvalidated; the only
+  real evidence available argues against its premise.
+- Outcome divergence is kept, because the same 25 triples *do* give it ground
+  truth — but only where outputs are structured and comparable, which is a
+  precondition and not a general capability.
+- This corpus can validate an outcome-diff detector and cannot validate a
+  path-diff one. Those are different things, and conflating them would have
+  produced a detector with nothing real to test against.
 
 ## Shape of a run
 
@@ -418,7 +502,7 @@ tempting mistake and the reason these projects end up as frontends.
 | 1 | **Ingest and store** | Point Claude Code at it, run a real task, see spans land in the database. | ~2 days |
 | 2 | **Reconstruct the tree** | A run with subagents renders as a correct nested tree. Transcript parser only -- no hook shim -- joined on `toolUseResult.agentId`, the workflow journal, and `uuid`/`parentUuid`. | ~3 days |
 | 3 | **Attribute cost** | Walk the tree assigning tokens to nodes, cache reads and both write TTLs split. Reconcile in three layers (see *Cost attribution, as verified*); the arithmetic invariant is the correctness test. | ~2 days |
-| 4 | **Detectors** | Loop detection, run-vs-run divergence, unacknowledged tool failures. Pure functions, unit tested against recorded fixtures. The intellectual core. | ~4 days |
+| 4 | **Detectors** | Redundant repeats, cost concentration, outcome divergence, unhandled errors. Pure functions, tested against a hand-labelled corpus sample. Path-diff divergence dropped on evidence -- see the negative result under Gap 3. | ~4 days |
 | 5 | **The screen** | Run list, tree view, cost breakdown, findings, diff. Now it earns the name "command center" — because there is something behind it worth commanding. | ~4 days |
 
 Timings assume part-time work alongside other commitments; treat them as
@@ -446,10 +530,14 @@ genuinely more fun than the data model. The phase order is the defence — if
 Phase 5 starts before Phase 4 finishes, the project has already failed at
 being what it claims to be.
 
-**The detectors are harder than they look.** Loop detection over noisy tool
-arguments is a real problem — identical intent rarely means identical bytes.
-Expect to need normalisation before hashing, and expect the first version to
-be wrong. That difficulty is also what makes it worth doing.
+**The detectors are harder than they look.** Confirmed, and more sharply
+than expected. Loop detection over noisy tool arguments is a real problem —
+identical intent rarely means identical bytes, and the first rule tried here
+("was there an intervening write to the same target?") was wrong on 8 of the
+9 cases it flagged, because files are also rewritten by background processes
+and by shell commands that leave no write in the trace. Comparing result
+hashes instead fixes that. Expect the first version of any detector here to
+be wrong, and expect to need a labelled sample to find out.
 
 **Overlap with other work cuts both ways.** This exists partly because a
 multi-agent system I work on elsewhere needs it, and building infrastructure

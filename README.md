@@ -135,6 +135,35 @@ table has not gone stale relative to theirs; if the two disagree, either
 table could be the wrong one. Reconciliation against actual billing is not
 something any local tool can do.
 
+## A negative result we kept
+
+One of the three originally planned detectors diffed two runs of the same
+task to find where their **execution paths** split. Before building it, the
+premise was tested against real data — and it does not hold.
+
+The corpus contained a natural experiment: a research workflow that sends the
+same claim to three independent verifier agents under a "≥2/3 refutations
+kill it" vote. That gives **25 tasks, each run three times**, of which 3 split
+on outcome and 22 agreed. Mean pairwise path distance within a triple:
+
+| | n | mean | range |
+| --- | --- | --- | --- |
+| Split on outcome | 3 | 0.878 | 0.823 – 0.944 |
+| Agreed | 22 | 0.839 | 0.738 – 0.961 |
+
+The ranges overlap almost entirely, and the single most path-divergent triple
+is one that *agreed*. One triple split on outcome while running an almost
+identical path; the most divergent triple agreed despite one member searching
+the web and two shelling out. Path divergence does not predict outcome
+divergence here.
+
+So path-diff divergence was dropped, outcome divergence was kept with its
+precondition stated, and the numbers live in
+[`docs/spec.md`](docs/spec.md) rather than being deleted quietly. A negative
+result that changes the design is worth as much as a positive one — and the
+first loop-detection rule tried here was wrong on 8 of the 9 cases it flagged,
+which is the same lesson twice.
+
 ## API
 
 | Route | Purpose |
