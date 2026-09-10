@@ -73,6 +73,116 @@ SPAN_COLUMNS = (
     "cache_creation_tokens", "attributes",
 )
 
+# --- Phase 2: transcript records and reconstructed trees --------------------
+#
+# Kept in their own tables rather than folded into `spans`. The transcript
+# path is deliberately independent of OTel ingest -- trace export is behind a
+# beta flag -- and sharing a table would couple the two schemas. `spans`
+# already carries `session_id`, and real spans do populate it, so the
+# correlation is available to Phase 3 without joining the writes.
+
+TRANSCRIPT_SCHEMA = """
+CREATE TABLE IF NOT EXISTS transcript_records (
+    uuid                  TEXT PRIMARY KEY,
+    session_id            TEXT NOT NULL,
+    agent_id              TEXT,
+    parent_uuid           TEXT,
+    type                  TEXT NOT NULL,
+    timestamp             TEXT NOT NULL DEFAULT '',
+    ts_ns                 INTEGER NOT NULL DEFAULT 0,
+    is_sidechain          INTEGER NOT NULL DEFAULT 0,
+    model                 TEXT,
+    request_id            TEXT,
+    tool_use_id           TEXT,
+    tool_name             TEXT,
+    tool_signature        TEXT,
+    is_tool_result        INTEGER NOT NULL DEFAULT 0,
+    is_error              INTEGER NOT NULL DEFAULT 0,
+    result_status         TEXT,
+    result_agent_id       TEXT,
+    result_run_id         TEXT,
+    input_tokens          INTEGER NOT NULL DEFAULT 0,
+    output_tokens         INTEGER NOT NULL DEFAULT 0,
+    cache_read_tokens     INTEGER NOT NULL DEFAULT 0,
+    cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
+    text_len              INTEGER NOT NULL DEFAULT 0,
+    content               TEXT,
+    ingested_at           TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_tr_session   ON transcript_records(session_id);
+CREATE INDEX IF NOT EXISTS idx_tr_agent     ON transcript_records(agent_id);
+CREATE INDEX IF NOT EXISTS idx_tr_tooluse   ON transcript_records(tool_use_id);
+CREATE INDEX IF NOT EXISTS idx_tr_signature ON transcript_records(tool_signature);
+CREATE INDEX IF NOT EXISTS idx_tr_ts        ON transcript_records(ts_ns);
+
+-- Materialised tree, rebuilt wholesale per session. Same discipline as the
+-- `runs` table: a re-parse after new records land must not be able to leave
+-- half a tree behind.
+CREATE TABLE IF NOT EXISTS tree_nodes (
+    node_id               TEXT NOT NULL,
+    session_id            TEXT NOT NULL,
+    parent_node_id        TEXT,
+    kind                  TEXT NOT NULL,
+    label                 TEXT NOT NULL DEFAULT '',
+    depth                 INTEGER NOT NULL DEFAULT 0,
+    ordinal               INTEGER NOT NULL DEFAULT 0,
+    agent_id              TEXT,
+    agent_type            TEXT,
+    tool_use_id           TEXT,
+    tool_name             TEXT,
+    tool_signature        TEXT,
+    record_uuid           TEXT,
+    link_basis            TEXT NOT NULL DEFAULT 'none',
+    status                TEXT NOT NULL DEFAULT 'ok',
+    note                  TEXT NOT NULL DEFAULT '',
+    start_ns              INTEGER NOT NULL DEFAULT 0,
+    end_ns                INTEGER NOT NULL DEFAULT 0,
+    duration_ms           REAL    NOT NULL DEFAULT 0,
+    input_tokens          INTEGER NOT NULL DEFAULT 0,
+    output_tokens         INTEGER NOT NULL DEFAULT 0,
+    cache_read_tokens     INTEGER NOT NULL DEFAULT 0,
+    cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
+    record_count          INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (session_id, node_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_tn_session ON tree_nodes(session_id);
+CREATE INDEX IF NOT EXISTS idx_tn_parent  ON tree_nodes(parent_node_id);
+CREATE INDEX IF NOT EXISTS idx_tn_kind    ON tree_nodes(kind);
+
+-- One row per parsed session: where it came from and what could not be read.
+CREATE TABLE IF NOT EXISTS transcript_sessions (
+    session_id    TEXT PRIMARY KEY,
+    project_slug  TEXT NOT NULL DEFAULT '',
+    path          TEXT NOT NULL DEFAULT '',
+    record_count  INTEGER NOT NULL DEFAULT 0,
+    node_count    INTEGER NOT NULL DEFAULT 0,
+    agent_count   INTEGER NOT NULL DEFAULT 0,
+    parse_errors  INTEGER NOT NULL DEFAULT 0,
+    warnings      TEXT NOT NULL DEFAULT '[]',
+    start_ns      INTEGER NOT NULL DEFAULT 0,
+    end_ns        INTEGER NOT NULL DEFAULT 0,
+    parsed_at     TEXT NOT NULL DEFAULT (datetime('now'))
+);
+"""
+
+RECORD_COLUMNS = (
+    "uuid", "session_id", "agent_id", "parent_uuid", "type", "timestamp",
+    "ts_ns", "is_sidechain", "model", "request_id", "tool_use_id", "tool_name",
+    "tool_signature", "is_tool_result", "is_error", "result_status",
+    "result_agent_id", "result_run_id", "input_tokens", "output_tokens",
+    "cache_read_tokens", "cache_creation_tokens", "text_len", "content",
+)
+
+NODE_COLUMNS = (
+    "node_id", "session_id", "parent_node_id", "kind", "label", "depth",
+    "ordinal", "agent_id", "agent_type", "tool_use_id", "tool_name",
+    "tool_signature", "record_uuid", "link_basis", "status", "note",
+    "start_ns", "end_ns", "duration_ms", "input_tokens", "output_tokens",
+    "cache_read_tokens", "cache_creation_tokens", "record_count",
+)
+
 
 class Store:
     def __init__(self, path: str | Path = "contrail.db") -> None:
@@ -84,6 +194,7 @@ class Store:
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("PRAGMA foreign_keys=ON")
         self.conn.executescript(SCHEMA)
+        self.conn.executescript(TRANSCRIPT_SCHEMA)
         self.conn.commit()
 
     def close(self) -> None:
@@ -163,6 +274,135 @@ class Store:
         spans = self.conn.execute("SELECT COUNT(*) FROM spans").fetchone()[0]
         runs = self.conn.execute("SELECT COUNT(*) FROM runs").fetchone()[0]
         return {"spans": spans, "runs": runs}
+
+
+    # -------------------------------------------------- transcripts (Phase 2)
+
+    def add_transcript_records(self, records: Iterable[Any]) -> int:
+        """Upsert transcript records, keyed on `uuid`.
+
+        Upserted for the same reason spans are: a session file is appended to
+        while it is live, so re-parsing it re-presents records we already
+        hold. `uuid` is stable across re-reads, so INSERT OR REPLACE converges
+        rather than duplicating.
+        """
+        records = list(records)
+        if not records:
+            return 0
+
+        placeholders = ", ".join(f":{c}" for c in RECORD_COLUMNS)
+        columns = ", ".join(RECORD_COLUMNS)
+        sql = (
+            f"INSERT OR REPLACE INTO transcript_records ({columns}) "
+            f"VALUES ({placeholders})"
+        )
+        rows = []
+        for rec in records:
+            row = {c: getattr(rec, c, None) for c in RECORD_COLUMNS}
+            row["is_sidechain"] = int(bool(rec.is_sidechain))
+            row["is_tool_result"] = int(bool(rec.is_tool_result))
+            row["is_error"] = int(bool(rec.is_error))
+            rows.append(row)
+
+        with self.conn:
+            self.conn.executemany(sql, rows)
+        return len(rows)
+
+    def save_tree(self, tree: Any, *, project_slug: str = "", path: str = "") -> int:
+        """Replace a session's materialised tree.
+
+        Wholesale delete-then-insert inside one transaction. A tree is only
+        meaningful as a whole -- a partial rebuild could leave a node pointing
+        at a parent that no longer exists -- so this mirrors `_refresh_run`
+        and stays the single place a tree is written.
+        """
+        placeholders = ", ".join(f":{c}" for c in NODE_COLUMNS)
+        columns = ", ".join(NODE_COLUMNS)
+        sql = f"INSERT INTO tree_nodes ({columns}) VALUES ({placeholders})"
+
+        rows = []
+        for ordinal, node in enumerate(tree.nodes):
+            row = {c: getattr(node, c, None) for c in NODE_COLUMNS}
+            row["ordinal"] = ordinal
+            row["duration_ms"] = node.duration_ms
+            rows.append(row)
+
+        nodes = tree.nodes
+        agent_count = sum(1 for n in nodes if n.kind == "subagent")
+        start_ns = min((n.start_ns for n in nodes if n.start_ns), default=0)
+        end_ns = max((n.end_ns for n in nodes), default=0)
+
+        with self.conn:
+            self.conn.execute(
+                "DELETE FROM tree_nodes WHERE session_id = ?", (tree.session_id,)
+            )
+            if rows:
+                self.conn.executemany(sql, rows)
+            self.conn.execute(
+                """
+                INSERT OR REPLACE INTO transcript_sessions (
+                    session_id, project_slug, path, record_count, node_count,
+                    agent_count, parse_errors, warnings, start_ns, end_ns,
+                    parsed_at
+                ) VALUES (?,?,?,?,?,?,?,?,?,?, datetime('now'))
+                """,
+                (
+                    tree.session_id,
+                    project_slug,
+                    path,
+                    sum(n.record_count for n in nodes),
+                    len(nodes),
+                    agent_count,
+                    tree.parse_errors,
+                    json.dumps(tree.warnings),
+                    start_ns,
+                    end_ns,
+                ),
+            )
+        return len(rows)
+
+    def tree_nodes(self, session_id: str) -> list[dict[str, Any]]:
+        """A session's nodes in build order, so a caller can rebuild nesting."""
+        rows = self.conn.execute(
+            "SELECT * FROM tree_nodes WHERE session_id = ? ORDER BY ordinal",
+            (session_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def transcript_sessions(self, limit: int = 25) -> list[dict[str, Any]]:
+        rows = self.conn.execute(
+            "SELECT * FROM transcript_sessions ORDER BY start_ns DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def transcript_session(self, session_id: str) -> dict[str, Any] | None:
+        row = self.conn.execute(
+            "SELECT * FROM transcript_sessions WHERE session_id = ?", (session_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def repeated_signatures(
+        self, session_id: str, min_count: int = 2
+    ) -> list[dict[str, Any]]:
+        """Tool signatures that occur more than once in a session.
+
+        Not a detector -- Phase 4 owns those, as pure functions over a tree.
+        This is the read that proves the signature column is queryable, and
+        it is the shape the loop detector will build on.
+        """
+        rows = self.conn.execute(
+            """
+            SELECT tool_name, tool_signature, COUNT(*) AS n
+              FROM transcript_records
+             WHERE session_id = ? AND tool_signature IS NOT NULL
+             GROUP BY tool_signature
+            HAVING n >= ?
+             ORDER BY n DESC, tool_name
+            """,
+            (session_id, min_count),
+        ).fetchall()
+        return [dict(r) for r in rows]
 
     @staticmethod
     def _row_to_span(row: sqlite3.Row) -> Span:

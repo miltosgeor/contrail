@@ -16,14 +16,15 @@ change.
 
 ## Current state
 
-Phase 1 complete: OTLP ingest (protobuf + JSON), SQLite store, read API, CLI.
-41 tests pass. Verified end to end against a real binary protobuf payload.
+Phases 1-2 complete. 110 tests pass. Phase 2 was verified against a real
+Claude Code data directory: 5 sessions and 148 subagent transcripts
+reconstruct with zero orphans and zero unreadable lines.
 
 | Phase | | Status |
 | --- | --- | --- |
 | 1 | Ingest and store | done |
-| 2 | Subagent tree reconstruction | next |
-| 3 | Cost attribution per node | |
+| 2 | Subagent tree reconstruction | done |
+| 3 | Cost attribution per node | next |
 | 4 | Loop / divergence / silent-failure detectors | |
 | 5 | The screen | |
 
@@ -40,10 +41,17 @@ contrail/
   otlp.py        OTLP/protobuf and OTLP/JSON decoding
   store.py       SQLite schema and queries
   collector.py   FastAPI app: OTLP ingest + JSON read API
-  cli.py         serve / runs / show / demo
+  transcript.py  JSONL session parser and subagent tree reconstruction
+  cli.py         serve / runs / show / demo / parse / sessions / tree
 tests/           mirrors the module names, one file each
 docs/spec.md     why this exists, the three gaps, the phase plan
 ```
+
+The two ingest paths are separate on purpose. `otlp.py` + `collector.py`
+read Claude Code's OpenTelemetry export; `transcript.py` reads the JSONL it
+writes to disk. `transcript.py` imports neither, and must not start to --
+trace export is behind a beta flag, and the transcript path is what keeps
+working if it moves. They meet only at the store.
 
 ## Conventions established — keep these
 
@@ -74,9 +82,43 @@ trace gains spans. Keep `_refresh_run` the single place that happens.
 (reads ~10%, writes ~125%), and Phase 3's cost attribution depends on the
 split. Never sum them together.
 
-## Working notes for Phase 2
+## Conventions established by Phase 2 -- keep these
 
-The goal is to nest subagent work under the run that spawned it.
+**The tree is joined in a fixed priority order, and the winning rule is
+recorded.** `toolUseResult.agentId` first, then `meta.json.toolUseId`, then
+workflow journal membership, then directory containment as a fallback that
+never fires on real data. Every subagent node stores which rule linked it in
+`link_basis`. A wrong tree must stay debuggable.
+
+**Never store a raw hash of prompt or argument text.** Tool calls are
+recorded as a *normalised* signature -- tool name plus canonicalised
+arguments, hashed -- so that Phase 4's loop detector can compare calls that
+differ only in whitespace or path separators. A raw hash cannot be
+normalised retroactively and would be storage thrown away. Extend
+`normalise_argument` rather than adding a second hashing scheme.
+
+**Node token counts are self cost, never rolled up.** Attributing spend to
+the node that caused it is Phase 3's decision; the parser must not
+pre-empt it. There is a test that catches double-counting -- it caught a
+real one.
+
+**`tree_nodes` is rebuilt wholesale per session**, the same discipline as
+`_refresh_run`. A partial rebuild can leave a node pointing at a parent that
+no longer exists.
+
+**Transcript records are upserted on `uuid`, and deduplicated on load.** A
+live session file is appended to, and a resumed one can write the same
+`uuid` twice -- observed on real data. Same at-least-once reasoning as spans.
+
+**Partial data degrades explicitly.** A referenced-but-absent subagent
+becomes a `missing_transcript` node, an unanswered tool call stays
+`incomplete`, an async workflow stays `pending`, and unreadable lines are
+counted. A tree that admits a gap is useful; one that silently omits it is
+a lie.
+
+## Working notes for Phase 2 -- done, kept for context
+
+The goal was to nest subagent work under the run that spawned it.
 
 - The format has now been read off disk and written up in
   `docs/spec.md` under **Transcript format, as verified** — 5 sessions and
