@@ -335,10 +335,45 @@ def test_the_absolute_floor_stops_trivial_runs_firing():
     assert D.detect_cost_concentration(run_with([900, 50, 50])) == []
 
 
-def test_both_thresholds_are_parameters_not_constants():
-    run = run_with([600_000, 400_000])
+def test_every_threshold_is_a_parameter_not_a_constant():
+    run = run_with([600_000, 200_000, 200_000])
     assert D.detect_cost_concentration(run, share_threshold=0.9) == []
     assert D.detect_cost_concentration(run, share_threshold=0.5)
+    assert D.detect_cost_concentration(run, min_siblings=4) == []
+    assert D.detect_cost_concentration(run, min_times_median=99) == []
+
+
+def test_two_siblings_is_arithmetic_not_concentration():
+    """One of two children holding most of the parent is near-inevitable.
+
+    Measured: share alone produced 11 findings on one real session, of which
+    7 were two-sibling workflows whose "dominant" child was 1.01x to 1.91x
+    its single sibling. Those buried the findings that meant something.
+    """
+    assert D.detect_cost_concentration(run_with([900_000, 100_000])) == []
+
+
+def test_a_node_barely_above_its_siblings_is_not_flagged():
+    """51% of three even-ish siblings is not disproportionate."""
+    assert D.detect_cost_concentration(
+        run_with([360_000, 340_000, 340_000])) == []
+
+
+def test_a_node_far_above_the_typical_sibling_is_flagged():
+    found = D.detect_cost_concentration(
+        run_with([900_000, 60_000, 60_000, 60_000]))
+    assert len(found) == 1
+    assert found[0].evidence["times_sibling_median"] == pytest.approx(15.0)
+
+
+def test_siblings_that_did_nothing_count_as_no_typical_sibling():
+    """A zero median means most siblings did essentially nothing, which is
+    concentration by any reading -- not a division to skip."""
+    run = run_with([900_000, 0, 0, 0])
+    run.nodes["agent:a1"].total_tokens = Tokens()
+    found = D.detect_cost_concentration(run, min_tokens=1000)
+    assert len(found) == 1
+    assert found[0].evidence["times_sibling_median"] == "no typical sibling"
 
 
 def test_the_floor_is_a_parameter_too():
@@ -385,16 +420,21 @@ def test_concentration_works_off_a_real_attribution():
                        "cache_creation_tokens": 0, "cache_write_5m_tokens": 0,
                        "cache_write_1h_tokens": 0, "thinking_tokens": 0})(),
     ]
-    for i, tok in enumerate((900_000, 50_000)):
+    for i, tok in enumerate((900_000, 30_000, 30_000)):
         nodes.append(type("N", (), {
             "node_id": f"agent:a{i}", "kind": "subagent", "label": f"a{i}",
             "parent_node_id": "session:s", "depth": 1, "input_tokens": tok,
             "output_tokens": 0, "cache_read_tokens": 0,
             "cache_creation_tokens": 0, "cache_write_5m_tokens": 0,
             "cache_write_1h_tokens": 0, "thinking_tokens": 0})())
-    recs = [Rec(uuid="r0", input_tokens=900_000), Rec(uuid="r1", input_tokens=50_000)]
-    run = attribute_cost(nodes, recs, {"r0": "agent:a0", "r1": "agent:a1"},
-                         PriceTable(), AT, "s")
+    recs = [Rec(uuid="r0", input_tokens=900_000),
+            Rec(uuid="r1", input_tokens=30_000),
+            Rec(uuid="r2", input_tokens=30_000)]
+    run = attribute_cost(
+        nodes, recs,
+        {"r0": "agent:a0", "r1": "agent:a1", "r2": "agent:a2"},
+        PriceTable(), AT, "s",
+    )
     found = D.detect_cost_concentration(run)
     assert [f.node_id for f in found] == ["agent:a0"]
     assert found[0].evidence["total_usd"] == pytest.approx(4.5)

@@ -1,8 +1,8 @@
 """Command line entry point.
 
     contrail serve                 start the collector
-    contrail runs                  list recent runs (OTel spans)
-    contrail show <trace_id>       print one run as a tree (OTel spans)
+    contrail traces                list recent OTel traces
+    contrail show <trace_id>       print one trace as a tree
     contrail demo                  load a synthetic run so the UI has content
 
     contrail parse                 read session transcripts from disk
@@ -39,18 +39,23 @@ def cmd_serve(args: argparse.Namespace) -> int:
 
     os.environ.setdefault("CONTRAIL_DB", args.db)
     print(f"contrail -> {args.db}")
-    print(f"OTLP endpoint: http://{args.host}:{args.port}/v1/traces")
+    print(f"  screen         http://{args.host}:{args.port}/")
+    print(f"  OTLP ingest    http://{args.host}:{args.port}/v1/traces")
+    print()
+    print("The screen reads transcripts and needs no telemetry. If it is")
+    print("empty, run: contrail parse")
     uvicorn.run(
         "contrail.collector:app", host=args.host, port=args.port, reload=args.reload
     )
     return 0
 
 
-def cmd_runs(args: argparse.Namespace) -> int:
+def cmd_traces(args: argparse.Namespace) -> int:
     store = Store(args.db)
     runs = store.runs(limit=args.limit)
     if not runs:
-        print("no runs yet -- start the collector and run a Claude Code task")
+        print("no traces yet -- start the collector and run a Claude Code task")
+        print("(transcripts need no collector: try `contrail parse`)")
         return 0
 
     print(f"{'TRACE':<18}{'ROOT':<34}{'SPANS':>6}{'ERR':>5}{'DURATION':>10}{'TOKENS':>10}")
@@ -69,7 +74,7 @@ def cmd_show(args: argparse.Namespace) -> int:
 
     matches = [r for r in store.runs(limit=500) if r["trace_id"].startswith(args.trace_id)]
     if not matches:
-        print(f"no run matching {args.trace_id!r}", file=sys.stderr)
+        print(f"no trace matching {args.trace_id!r}", file=sys.stderr)
         return 1
     trace_id = matches[0]["trace_id"]
 
@@ -539,11 +544,11 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--reload", action="store_true")
     p.set_defaults(func=cmd_serve)
 
-    p = sub.add_parser("runs", help="list recent runs")
+    p = sub.add_parser("traces", help="list recent OTel traces")
     p.add_argument("--limit", type=int, default=25)
-    p.set_defaults(func=cmd_runs)
+    p.set_defaults(func=cmd_traces)
 
-    p = sub.add_parser("show", help="print one run as a tree")
+    p = sub.add_parser("show", help="print one trace as a tree")
     p.add_argument("trace_id", help="full or partial trace id")
     p.set_defaults(func=cmd_show)
 

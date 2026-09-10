@@ -16,8 +16,7 @@ change.
 
 ## Current state
 
-Phases 1-4 complete. 241 tests pass. The detectors run against real traces,
-which was the condition for starting Phase 5.
+All five phases complete. 251 tests pass.
 
 | Phase | | Status |
 | --- | --- | --- |
@@ -25,7 +24,7 @@ which was the condition for starting Phase 5.
 | 2 | Subagent tree reconstruction | done |
 | 3 | Cost attribution per node | done |
 | 4 | Detectors | done |
-| 5 | The screen | next |
+| 5 | The screen | done |
 
 **Phase 4's labelled sets are small and every claim about them is quoted with
 its size.** Redundant repeats: 22 groups, 6 positive, 15 negative, 1
@@ -35,10 +34,11 @@ Outcome divergence: 25 real verifier triples, 3 split, 22 agreed. Path-diff
 divergence was dropped on evidence -- see the negative result in
 `docs/spec.md`.
 
-**Phase order is a constraint, not a suggestion.** Phases 2–4 are the reason
-this project exists. Starting Phase 5 early is the documented failure mode —
-it turns the repo into a frontend with an AI costume. Do not begin UI work
-until the detectors in Phase 4 run against real traces.
+**The phase order held, and the constraint still applies to changes.** Phases
+2–4 are the reason this project exists; the UI came last and stayed small.
+The failure mode is still live: the screen is more fun to work on than the
+data model. If a change makes the screen nicer without making the analysis
+better, it is the wrong change.
 
 ## Layout
 
@@ -53,7 +53,8 @@ contrail/
   prices.json    the price table -- data with effective dates, not code
   detectors.py   redundant repeats, cost concentration, outcome divergence,
                  unhandled errors -- pure functions over a run tree
-  cli.py         serve / runs / show / demo / parse / sessions / tree /
+  index.html     the screen -- one static file, no build step
+  cli.py         serve / traces / show / demo / parse / sessions / tree /
                  cost / reconcile / findings
 tests/           mirrors the module names, one file each
 docs/spec.md     why this exists, the three gaps, the phase plan
@@ -219,6 +220,44 @@ the CLI emits on failure are neither prompt text nor tool arguments, so
 matching them is allowed where storing a message would not be — but only the
 resulting short class label is stored, never the text. That distinction is
 what took `unhandled_errors` precision from 3/14 to 3/4.
+
+## Conventions established by Phase 5 -- keep these
+
+**No build step, and no dependency the page fetches at runtime.** One static
+`index.html` served by FastAPI, so `pip install -e .` is the whole setup and
+the page works offline. A node toolchain would make the UI likelier to become
+the project. There is a test asserting the page pulls no external script.
+
+**If `index.html` outgrows ~800 lines, stop.** That is the tripwire, not a
+target. It is currently ~510. Reaching for a bundler is the wrong response;
+cutting scope is the right one.
+
+**The screen opens on findings and cost, never on a list of traces.** Every
+agent observability tool opens on traces. The tree is reachable only from a
+finding or a cost bar, and that ordering is the product claim made visible.
+
+**Tokens lead, dollars enrich.** Tokens are always known and never unpriced,
+so rank and compare on them; USD appears where the price table covers the
+session's own date and reads `unpriced` where it does not. That keeps a
+mostly-unpriced corpus informative instead of looking broken. The
+at-today's-prices toggle is labelled a counterfactual.
+
+**A wide level is a picture, not a list.** Above 12 children, siblings render
+as a cost-proportional strip -- one bar per child, width by tokens, marked if
+it carries a finding. Fan-out is the normal shape of this data (465 turns
+under one session, 100 subagents under one workflow), so this is the general
+rule, not a workflow special case.
+
+**The screen states its own limits.** "What this does not detect, and why" is
+in the product, open by default, carrying the divergence negative result and
+the reasons. A tool that says what it cannot see makes a stronger claim than
+one that says it in a README.
+
+**`traces` and `sessions` are different objects.** `/api/traces` is the OTLP
+span path keyed by trace id; `/api/sessions` is the transcript path keyed by
+session id. Never name them the same thing -- it implies a join that does not
+exist. "Run" is deliberately unused, left for the contiguous-segment idea: a
+session file can span months of resumes, so a run is not a session.
 
 ## Working notes for Phase 2 -- done, kept for context
 

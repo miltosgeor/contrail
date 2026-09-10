@@ -1,0 +1,510 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Contrail</title>
+<!--
+  One file, no build step. A read-only view over a JSON API needs no
+  framework, and a node toolchain would make the UI likelier to become the
+  project -- the failure mode docs/spec.md names. If this outgrows ~800
+  lines, that is the signal to stop rather than reach for a bundler.
+
+  The layout is the product claim made visible: findings and cost first,
+  tree last and collapsed. You cannot browse the trace as the primary
+  activity, because the front door does not offer it.
+-->
+<style>
+  :root {
+    --bg: #0e1116; --panel: #161b22; --line: #262d38; --ink: #e6edf3;
+    --dim: #8b949e; --dimmer: #5d6673;
+    --hot: #f87171; --warm: #fbbf24; --cool: #58a6ff; --ok: #3fb950;
+    --mono: ui-monospace, SFMono-Regular, "Cascadia Mono", Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 14px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  a { color: var(--cool); }
+  header {
+    padding: 18px 26px 14px; border-bottom: 1px solid var(--line);
+    display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap;
+  }
+  header h1 { margin: 0; font-size: 17px; letter-spacing: .02em; }
+  header .tag { color: var(--dim); font-size: 12.5px; }
+  header .spacer { flex: 1; }
+  main { padding: 0 26px 60px; max-width: 1180px; }
+  section { margin-top: 26px; }
+  h2 {
+    font-size: 11px; text-transform: uppercase; letter-spacing: .1em;
+    color: var(--dim); margin: 0 0 10px; font-weight: 600;
+  }
+  h2 .count { color: var(--dimmer); text-transform: none; letter-spacing: 0; }
+  .panel {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 7px;
+  }
+  .muted { color: var(--dim); }
+  .dimmer { color: var(--dimmer); }
+  .num { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+
+  /* --- session picker ------------------------------------------------ */
+  .sess {
+    display: grid; grid-template-columns: 1fr auto auto auto;
+    gap: 18px; align-items: center; width: 100%;
+    padding: 11px 14px; background: none; border: 0; border-top: 1px solid var(--line);
+    color: inherit; font: inherit; text-align: left; cursor: pointer;
+  }
+  .sess:first-child { border-top: 0; }
+  .sess:hover { background: #1c2230; }
+  .sess[aria-current="true"] { background: #1f2937; box-shadow: inset 2px 0 0 var(--cool); }
+  .sess .id { font-family: var(--mono); font-size: 13px; }
+  .sess .proj { color: var(--dimmer); font-size: 12px; }
+  .pill {
+    font-size: 11.5px; padding: 2px 8px; border-radius: 999px;
+    border: 1px solid var(--line); color: var(--dim); white-space: nowrap;
+  }
+  .pill.hot { color: var(--hot); border-color: #5b2626; background: #2a1618; }
+  .pill.clean { color: var(--ok); border-color: #1e4429; background: #10251a; }
+
+  /* --- findings ------------------------------------------------------ */
+  .finding { padding: 12px 14px; border-top: 1px solid var(--line); }
+  .finding:first-child { border-top: 0; }
+  .finding .head { display: flex; gap: 9px; align-items: center; flex-wrap: wrap; }
+  .det {
+    font-family: var(--mono); font-size: 11.5px; color: var(--warm);
+  }
+  .det.low { color: var(--dim); }
+  .finding .txt { margin: 5px 0 0; }
+  .finding .meta { margin-top: 5px; font-size: 12px; color: var(--dimmer); }
+  .drill {
+    background: none; border: 1px solid var(--line); color: var(--cool);
+    font: inherit; font-size: 12px; padding: 2px 9px; border-radius: 5px;
+    cursor: pointer;
+  }
+  .drill:hover { background: #1c2230; }
+
+  /* --- cost strip ---------------------------------------------------- */
+  .strip { display: block; width: 100%; height: 34px; }
+  .strip rect { cursor: pointer; }
+  .strip rect:hover { opacity: .75; }
+  .legend { display: flex; gap: 16px; font-size: 12px; color: var(--dimmer); margin-top: 7px; }
+  .swatch { display: inline-block; width: 9px; height: 9px; border-radius: 2px; margin-right: 5px; }
+  .holder {
+    display: grid; grid-template-columns: 1fr auto auto; gap: 14px;
+    padding: 8px 14px; border-top: 1px solid var(--line); align-items: baseline;
+  }
+  .holder .bar { height: 3px; background: var(--cool); border-radius: 2px; margin-top: 5px; }
+
+  /* --- tree ---------------------------------------------------------- */
+  .row {
+    display: grid; grid-template-columns: 1fr auto auto; gap: 14px;
+    padding: 4px 14px; align-items: baseline; font-size: 13px;
+    border-left: 2px solid transparent;
+  }
+  .row:hover { background: #1c2230; }
+  .row.flagged { border-left-color: var(--hot); background: #1e1719; }
+  .row.focus { border-left-color: var(--cool); background: #1f2937; }
+  .row .lbl { font-family: var(--mono); white-space: pre; overflow: hidden; text-overflow: ellipsis; }
+  .kind { color: var(--dimmer); }
+  .more {
+    padding: 5px 14px 5px; font-size: 12px; color: var(--dim);
+    font-family: var(--mono);
+  }
+  .more button {
+    background: none; border: 0; color: var(--cool); cursor: pointer;
+    font: inherit; padding: 0;
+  }
+  .row .lbl button { width: 1.2em; text-align: left; color: var(--dim); }
+  .row .lbl button:hover { color: var(--cool); }
+  details.limits { margin-top: 12px; }
+  details.limits summary {
+    cursor: pointer; font-size: 12px; color: var(--dim); padding: 2px 0;
+  }
+  details.limits li { margin-bottom: 7px; font-size: 12.5px; color: var(--dim); }
+  details.limits b { color: var(--ink); font-weight: 600; }
+  .empty { padding: 24px; }
+  .empty h3 { margin: 0 0 8px; font-size: 15px; }
+  .empty pre {
+    background: #0b0e13; border: 1px solid var(--line); border-radius: 6px;
+    padding: 12px 14px; overflow-x: auto; font-family: var(--mono);
+    font-size: 12.5px; color: var(--ink);
+  }
+  .err { color: var(--hot); padding: 14px; }
+</style>
+
+<header>
+  <h1>Contrail</h1>
+  <span class="tag">findings and cost over Claude agent sessions</span>
+  <span class="spacer"></span>
+  <span class="tag" id="priced"></span>
+</header>
+
+<main>
+  <section id="sessions-wrap">
+    <h2>Sessions <span class="count" id="sess-count"></span></h2>
+    <div class="panel" id="sessions"><div class="muted" style="padding:14px">loading…</div></div>
+  </section>
+
+  <section id="detail" hidden>
+    <h2>What's wrong <span class="count" id="find-count"></span></h2>
+    <div class="panel" id="findings"></div>
+    <details class="limits" open>
+      <summary>What this does not detect, and why</summary>
+      <ul id="not-detected"></ul>
+    </details>
+  </section>
+
+  <section id="cost-wrap" hidden>
+    <h2>Where the tokens went</h2>
+    <div class="panel" id="cost"></div>
+  </section>
+
+  <section id="tree-wrap" hidden>
+    <h2>Tree <span class="count">evidence — opened from a finding or a bar</span></h2>
+    <div class="panel" id="tree"></div>
+  </section>
+</main>
+
+<script>
+"use strict";
+
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) =>
+  ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+
+// Tokens lead everywhere: they are always known and never unpriced. USD is
+// an enrichment, shown where the price table covers the session's own date.
+const tok = (n) => n >= 1e9 ? (n / 1e9).toFixed(2) + "B"
+  : n >= 1e6 ? (n / 1e6).toFixed(1) + "M"
+  : n >= 1e3 ? (n / 1e3).toFixed(1) + "k" : String(n ?? 0);
+const usd = (v) => v == null ? null
+  : v >= 100 ? "$" + v.toLocaleString(undefined, { maximumFractionDigits: 0 })
+  : "$" + v.toFixed(2);
+
+let STATE = { sessions: [], earliest: null, current: null, detail: null, at: null };
+
+// A node with many children is not a list. Above this, siblings render as a
+// cost-proportional strip -- 100 bars is a picture, 100 rows is a scroll.
+const STRIP_ABOVE = 12;
+const NAMED_HOLDERS = 3;
+
+async function get(url) {
+  const r = await fetch(url);
+  if (!r.ok) throw new Error(`${r.status} ${await r.text()}`);
+  return r.json();
+}
+
+// ---------------------------------------------------------------- sessions
+
+function renderSessions() {
+  const el = $("sessions");
+  if (!STATE.sessions.length) return renderEmpty();
+  $("sess-count").textContent = `${STATE.sessions.length} parsed`;
+  el.innerHTML = STATE.sessions.map((s) => {
+    const money = usd(s.total_usd);
+    const cost = money
+      ? `<span class="num">${money}</span>`
+      : `<span class="dimmer" title="priced at the session's own date, ${esc(s.priced_at)}; the earliest confirmed price is ${esc(STATE.earliest || "unknown")}">unpriced</span>`;
+    const flag = s.finding_count
+      ? `<span class="pill hot">${s.finding_count} finding${s.finding_count === 1 ? "" : "s"}</span>`
+      : `<span class="pill clean">clean</span>`;
+    return `<button class="sess" data-id="${esc(s.session_id)}"
+        aria-current="${s.session_id === STATE.current}">
+      <span><span class="id">${esc(s.session_id.slice(0, 8))}</span>
+        <span class="proj">${esc(s.project)}</span></span>
+      ${flag}
+      <span class="num" title="${(s.tokens.billable).toLocaleString()} billable tokens">${tok(s.tokens.billable)} tok</span>
+      ${cost}
+    </button>`;
+  }).join("");
+  el.querySelectorAll(".sess").forEach((b) =>
+    b.addEventListener("click", () => select(b.dataset.id)));
+}
+
+function renderEmpty() {
+  // The most likely first experience a stranger has. Send them somewhere.
+  $("sess-count").textContent = "none yet";
+  $("sessions").innerHTML = `<div class="empty">
+    <h3>No sessions parsed yet</h3>
+    <p class="muted">Contrail reads the JSONL transcripts Claude Code already
+      writes to disk. Nothing is running yet, so there is nothing to show.</p>
+    <p class="muted">Read your own sessions — no telemetry or collector needed:</p>
+    <pre>contrail parse
+contrail sessions</pre>
+    <p class="muted">Or load a synthetic run to see the shape of it:</p>
+    <pre>contrail demo</pre>
+    <p class="muted">To capture OpenTelemetry spans too, point Claude Code at
+      the collector in the shell where you run it:</p>
+    <pre>export CLAUDE_CODE_ENABLE_TELEMETRY=1
+export CLAUDE_CODE_ENHANCED_TELEMETRY_BETA=1
+export OTEL_TRACES_EXPORTER=otlp
+export OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
+export OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318</pre>
+    <p class="dimmer">Spans give timing and structure. Tokens and cost come
+      from the transcripts, which is why <code>contrail parse</code> works on
+      its own.</p>
+  </div>`;
+}
+
+// ---------------------------------------------------------------- findings
+
+function renderFindings() {
+  const { findings, not_detected } = STATE.detail;
+  $("find-count").textContent = findings.length
+    ? `${findings.length} in this session` : "nothing flagged";
+  $("detail").hidden = false;
+
+  $("not-detected").innerHTML = (not_detected || []).map((n) =>
+    `<li><b>${esc(n.what)}</b> — ${esc(n.why)}</li>`).join("");
+
+  if (!findings.length) {
+    $("findings").innerHTML = `<div class="empty"><p class="muted">
+      No redundant repeats, no disproportionate cost, no unhandled errors.
+      This session came back clean — which is a result, not an absence.</p></div>`;
+    return;
+  }
+
+  const order = { cost_concentration: 0, redundant_repeats: 1, outcome_divergence: 2, unhandled_errors: 3 };
+  const sorted = [...findings].sort((a, b) =>
+    (order[a.detector] ?? 9) - (order[b.detector] ?? 9));
+
+  $("findings").innerHTML = sorted.map((f, i) => {
+    const name = f.detector + (f.subtype ? "/" + f.subtype : "");
+    const low = f.confidence !== "high";
+    // Precision and sample size on screen, not tucked in a docstring.
+    const bits = [];
+    if (low) bits.push(`${esc(f.confidence)} confidence`);
+    if (f.evidence.measured_precision) bits.push(esc(f.evidence.measured_precision));
+    if (f.evidence.labelled_sample) bits.push("labelled set: " + esc(f.evidence.labelled_sample));
+    if (f.evidence.thresholds_note) bits.push(esc(f.evidence.thresholds_note));
+    if (f.evidence.note) bits.push(esc(f.evidence.note));
+    return `<div class="finding">
+      <div class="head">
+        <span class="det ${low ? "low" : ""}">${esc(name)}</span>
+        ${f.node_id ? `<button class="drill" data-node="${esc(f.node_id)}">show in tree</button>` : ""}
+      </div>
+      <p class="txt">${esc(f.summary)}</p>
+      ${bits.length ? `<div class="meta">${bits.join(" · ")}</div>` : ""}
+    </div>`;
+  }).join("");
+
+  $("findings").querySelectorAll(".drill").forEach((b) =>
+    b.addEventListener("click", () => focusNode(b.dataset.node)));
+}
+
+// ------------------------------------------------------------------- cost
+
+function childrenOf(tree) {
+  const kids = new Map();
+  tree.forEach((n) => {
+    const k = n.parent_node_id;
+    if (!kids.has(k)) kids.set(k, []);
+    kids.get(k).push(n);
+  });
+  return kids;
+}
+
+function renderCost() {
+  const { tree, summary, findings } = STATE.detail;
+  const kids = childrenOf(tree);
+  const flagged = new Set(findings.map((f) => f.node_id));
+  const roots = tree.filter((n) => !n.parent_node_id ||
+    !tree.some((m) => m.node_id === n.parent_node_id));
+  const root = roots[0];
+  if (!root) { $("cost-wrap").hidden = true; return; }
+
+  // Show the widest meaningful level: the deepest node whose children still
+  // account for essentially all the cost. That is where concentration lives.
+  let level = root;
+  for (;;) {
+    const cs = (kids.get(level.node_id) || []);
+    if (cs.length !== 1) break;
+    level = cs[0];
+  }
+  const sibs = (kids.get(level.node_id) || [])
+    .filter((n) => n.tokens > 0)
+    .sort((a, b) => b.tokens - a.tokens);
+  if (!sibs.length) { $("cost-wrap").hidden = true; return; }
+
+  const total = sibs.reduce((a, n) => a + n.tokens, 0) || 1;
+  $("cost-wrap").hidden = false;
+  $("cost").innerHTML =
+    `<div style="padding:12px 14px 4px">
+       <div class="muted" style="font-size:12.5px;margin-bottom:8px">
+         ${sibs.length} ${esc(sibs[0].kind)}${sibs.length === 1 ? "" : "s"} under
+         ${esc(level.kind)} <span class="num">${esc(String(level.label).slice(0, 34))}</span>
+         — width is share of ${tok(total)} tokens
+       </div>
+       ${strip(sibs, total, flagged)}
+       <div class="legend">
+         <span><i class="swatch" style="background:var(--cool)"></i>node</span>
+         <span><i class="swatch" style="background:var(--hot)"></i>carries a finding</span>
+         <span>click a bar to open it in the tree</span>
+       </div>
+     </div>
+     ${sibs.slice(0, NAMED_HOLDERS).map((n) => holder(n, total)).join("")}
+     ${sibs.length > NAMED_HOLDERS ? tail(sibs, total) : ""}`;
+
+  $("cost").querySelectorAll("[data-node]").forEach((el) =>
+    el.addEventListener("click", () => focusNode(el.dataset.node)));
+}
+
+function strip(sibs, total, flagged) {
+  // Width proportional to tokens, with a 2px floor so nothing vanishes.
+  const W = 1000, H = 34, GAP = 1;
+  let x = 0;
+  const bars = sibs.map((n) => {
+    const w = Math.max(2, (n.tokens / total) * (W - sibs.length * GAP));
+    const r = `<rect x="${x.toFixed(2)}" y="0" width="${w.toFixed(2)}" height="${H}"
+      rx="1.5" fill="${flagged.has(n.node_id) ? "var(--hot)" : "var(--cool)"}"
+      data-node="${esc(n.node_id)}"><title>${esc(String(n.label).slice(0, 60))}
+${tok(n.tokens)} tok · ${((n.tokens / total) * 100).toFixed(1)}%${usd(n.total_usd) ? " · " + usd(n.total_usd) : " · unpriced"}</title></rect>`;
+    x += w + GAP;
+    return r;
+  }).join("");
+  return `<svg class="strip" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none"
+    role="img" aria-label="token share by node">${bars}</svg>`;
+}
+
+function holder(n, total) {
+  const share = (n.tokens / total) * 100;
+  const money = usd(n.total_usd);
+  return `<div class="holder" data-node="${esc(n.node_id)}" style="cursor:pointer">
+    <span><span class="kind">${esc(n.kind)}</span>
+      ${esc(String(n.label).slice(0, 58))}
+      <div class="bar" style="width:${Math.max(1, share).toFixed(1)}%"></div></span>
+    <span class="num">${tok(n.tokens)} tok</span>
+    <span class="num">${share.toFixed(0)}%${money ? " · " + money : ""}</span>
+  </div>`;
+}
+
+function tail(sibs, total) {
+  const rest = sibs.slice(NAMED_HOLDERS);
+  const t = rest.reduce((a, n) => a + n.tokens, 0);
+  return `<div class="more">+ ${rest.length} more —
+    ${tok(t)} tok, ${((t / total) * 100).toFixed(0)}% of the total</div>`;
+}
+
+// ------------------------------------------------------------------- tree
+
+let TREE_OPEN = new Set();
+// Expanding a wide level is opt-in and per node, so one click never turns
+// the tree back into a 465-row list everywhere.
+let TREE_EXPANDED = new Set();
+
+function renderTree(focus) {
+  const { tree, findings } = STATE.detail;
+  const kids = childrenOf(tree);
+  const byId = new Map(tree.map((n) => [n.node_id, n]));
+  const flagged = new Set(findings.map((f) => f.node_id));
+  const roots = tree.filter((n) => !n.parent_node_id || !byId.has(n.parent_node_id));
+  $("tree-wrap").hidden = false;
+
+  const out = [];
+  const walk = (node, depth) => {
+    const kid = kids.get(node.node_id) || [];
+    const open = TREE_OPEN.has(node.node_id);
+    const money = usd(node.total_usd);
+    const label = (node.kind === "tool" && node.tool_name) ? node.tool_name : node.label;
+    const status = node.status && node.status !== "ok"
+      ? ` <span class="dimmer">&lt;${esc(node.status)}&gt;</span>` : "";
+    const caret = kid.length
+      ? `<button class="more" style="padding:0" data-toggle="${esc(node.node_id)}">${open ? "-" : "+"}</button>`
+      : "&nbsp;&nbsp;";
+    out.push(`<div class="row ${flagged.has(node.node_id) ? "flagged" : ""} ${
+        node.node_id === focus ? "focus" : ""}" id="n-${esc(node.node_id)}">
+      <span class="lbl">${"  ".repeat(depth)}${caret} <span class="kind">${
+        esc(node.kind)}</span> ${esc(String(label).slice(0, 66))}${status}</span>
+      <span class="num muted">${node.tokens ? tok(node.tokens) + " tok" : ""}</span>
+      <span class="num muted">${money || ""}</span>
+    </div>`);
+    if (!open) return;
+
+    // Same rule as the strip: a wide level is summarised, not listed.
+    const wide = kid.length > STRIP_ABOVE && !TREE_EXPANDED.has(node.node_id);
+    const shown = wide
+      ? [...kid].sort((a, b) => b.tokens - a.tokens).slice(0, NAMED_HOLDERS)
+      : kid;
+    shown.forEach((c) => walk(c, depth + 1));
+    if (shown.length < kid.length) {
+      out.push(`<div class="more">${"  ".repeat(depth + 1)}+ ${
+        kid.length - shown.length} more ${esc(kid[0].kind)}s (by tokens) &mdash;
+        <button data-expand="${esc(node.node_id)}">show all</button></div>`);
+    }
+  };
+  roots.forEach((r) => { TREE_OPEN.add(r.node_id); walk(r, 0); });
+  $("tree").innerHTML = out.join("");
+
+  $("tree").querySelectorAll("[data-toggle]").forEach((b) =>
+    b.addEventListener("click", () => {
+      const id = b.dataset.toggle;
+      if (TREE_OPEN.has(id)) TREE_OPEN.delete(id); else TREE_OPEN.add(id);
+      renderTree(focus);
+    }));
+  $("tree").querySelectorAll("[data-expand]").forEach((b) =>
+    b.addEventListener("click", () => {
+      TREE_EXPANDED.add(b.dataset.expand);
+      renderTree(focus);
+    }));
+}
+
+function focusNode(nodeId) {
+  // Open every ancestor, then scroll to it. The tree is evidence for a
+  // finding, so it opens where the finding is.
+  const { tree } = STATE.detail;
+  const byId = new Map(tree.map((n) => [n.node_id, n]));
+  let cur = byId.get(nodeId);
+  const chain = [];
+  while (cur) { chain.push(cur.node_id); cur = byId.get(cur.parent_node_id); }
+  chain.forEach((id) => TREE_OPEN.add(id));
+  // Ancestors of the target must show it even if they are wide levels.
+  chain.slice(1).forEach((id) => TREE_EXPANDED.add(id));
+  renderTree(nodeId);
+  const el = document.getElementById("n-" + nodeId);
+  if (el) el.scrollIntoView({ behavior: "smooth", block: "center" });
+}
+
+// ------------------------------------------------------------------- boot
+
+async function select(id) {
+  STATE.current = id;
+  renderSessions();
+  TREE_OPEN = new Set();
+  TREE_EXPANDED = new Set();
+  try {
+    const q = STATE.at ? `?at=${encodeURIComponent(STATE.at)}` : "";
+    STATE.detail = await get(`/api/sessions/${id}${q}`);
+  } catch (e) {
+    $("findings").innerHTML = `<div class="err">${esc(e.message)}</div>`;
+    return;
+  }
+  const s = STATE.detail.summary;
+  $("priced").innerHTML = `priced at ${esc(s.priced_at)}` +
+    (STATE.at ? ` <span class="dimmer">(counterfactual)</span>` : ` <span class="dimmer">(the session's own date)</span>`) +
+    ` · <button class="drill" id="toggle-at">${STATE.at ? "use the session's date" : "at today's prices"}</button>`;
+  $("toggle-at").addEventListener("click", () => {
+    STATE.at = STATE.at ? null : new Date().toISOString().slice(0, 10);
+    boot();
+  });
+  renderFindings();
+  renderCost();
+  renderTree(null);
+}
+
+async function boot() {
+  try {
+    const q = STATE.at ? `?at=${encodeURIComponent(STATE.at)}` : "";
+    const data = await get("/api/sessions" + q);
+    STATE.sessions = data.sessions;
+    STATE.earliest = data.earliest_price;
+  } catch (e) {
+    $("sessions").innerHTML = `<div class="err">${esc(e.message)}</div>`;
+    return;
+  }
+  if (!STATE.sessions.length) { renderEmpty(); return; }
+  const pick = STATE.current || STATE.sessions[0].session_id;
+  renderSessions();
+  await select(pick);
+}
+
+boot();
+</script>

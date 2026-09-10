@@ -477,8 +477,22 @@ trees are small.
 findings with a span id. This is the part that gets unit tests, and the part
 that makes the repo look like engineering.
 
-**UI.** React, reading a JSON API. Run list, run tree, cost breakdown,
-findings panel, run-vs-run diff. Deliberately last.
+**The screen.** One static HTML file served by FastAPI over the JSON API --
+no build step, so `pip install -e .` remains the entire setup. Four things:
+session list, findings, cost breakdown, tree. Deliberately last, and
+deliberately small: a node toolchain would make the UI likelier to become the
+project, which is the failure mode this document names. If `index.html`
+outgrows ~800 lines, that is the signal to stop rather than reach for a
+bundler.
+
+**It opens on findings and cost, not on a list of traces.** Every agent
+observability tool opens on traces; opening there would make this one of
+them. The tree is where you drill for evidence, reachable only from a finding
+or a cost bar, and that ordering is the product claim made visible.
+
+Run-vs-run diff does not appear: path-diff divergence was dropped on evidence
+(see the negative result under Gap 3) and outcome divergence needs a task
+grouping that cannot be derived generically.
 
 ### On schema
 
@@ -503,7 +517,7 @@ tempting mistake and the reason these projects end up as frontends.
 | 2 | **Reconstruct the tree** | A run with subagents renders as a correct nested tree. Transcript parser only -- no hook shim -- joined on `toolUseResult.agentId`, the workflow journal, and `uuid`/`parentUuid`. | ~3 days |
 | 3 | **Attribute cost** | Walk the tree assigning tokens to nodes, cache reads and both write TTLs split. Reconcile in three layers (see *Cost attribution, as verified*); the arithmetic invariant is the correctness test. | ~2 days |
 | 4 | **Detectors** | Redundant repeats, cost concentration, outcome divergence, unhandled errors. Pure functions, tested against a hand-labelled corpus sample. Path-diff divergence dropped on evidence -- see the negative result under Gap 3. | ~4 days |
-| 5 | **The screen** | Run list, tree view, cost breakdown, findings, diff. Now it earns the name "command center" — because there is something behind it worth commanding. | ~4 days |
+| 5 | **The screen** | Session list, findings, cost breakdown, tree — opening on findings and cost, with the tree reachable only from a finding. One static file, no build step. Diff dropped: see the Gap 3 negative result. | ~4 days |
 
 Timings assume part-time work alongside other commitments; treat them as
 ordering, not deadlines.

@@ -14,19 +14,39 @@ actually cost you an afternoon:
 Contrail is the layer that answers those. The dashboard is the front end of a
 data model, not the product. Full reasoning in [`docs/spec.md`](docs/spec.md).
 
-**Status: Phase 4 of 5.** Ingest, store, subagent tree reconstruction, cost
-attribution and the detectors all work. The screen is next.
+**Status: all five phases complete.** Ingest, store, subagent tree
+reconstruction, cost attribution, the detectors, and the screen.
+
+![Contrail](docs/screenshot.png)
+
+Real data — six of the author's own Claude Code sessions, including the one
+that built Contrail (`cec62d6f`, clean). The screen opens on **findings and
+cost**, not on a list of traces: every agent observability tool opens on
+traces, and opening there would make this one of them. The tree is where you
+drill for evidence, reachable only from a finding or a cost bar.
 
 ---
 
 ## Quick start
 
+No build step. `pip install` is the entire setup — there is no node
+toolchain, no bundler, and the page loads no external asset.
+
 ```bash
 pip install -e ".[dev]"
 
-contrail demo                # load a synthetic run
-contrail runs                # list runs
-contrail show a1b2c3d4       # print one run as a tree
+contrail parse               # read the sessions Claude Code already wrote
+contrail serve               # screen on http://127.0.0.1:4318/
+```
+
+`contrail parse` needs no telemetry and no collector: it reads the JSONL
+transcripts from disk. Spans add timing and structure, but tokens and cost
+come from the transcripts.
+
+```bash
+contrail demo                # load a synthetic trace instead
+contrail traces              # list OTel traces
+contrail show a1b2c3d4       # print one trace as a tree
 ```
 
 ```
@@ -57,7 +77,7 @@ export OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318
 export OTEL_TRACES_EXPORT_INTERVAL=1000         # flush fast while developing
 ```
 
-Run any Claude Code task, then `contrail runs`.
+Run any Claude Code task, then `contrail traces` — or open the screen.
 
 Nothing is captured by default beyond structure — span names, durations,
 token counts. Tool arguments and prompt text only arrive if you opt in with
@@ -221,8 +241,11 @@ which is the same lesson twice.
 | --- | --- |
 | `POST /v1/traces` | OTLP/HTTP ingest — protobuf or JSON |
 | `GET /health` | Status and row counts |
-| `GET /api/runs?limit=25` | Recent runs |
-| `GET /api/runs/{trace_id}` | One run with its spans |
+| `GET /` | The screen — one static file, no build step |
+| `GET /api/sessions?limit=25` | Sessions with findings and cost, ranked by findings |
+| `GET /api/sessions/{session_id}` | One session: summary, tree, per-node cost, findings |
+| `GET /api/traces?limit=25` | Recent OTel traces |
+| `GET /api/traces/{trace_id}` | One trace with its spans |
 
 ## Layout
 
@@ -236,9 +259,10 @@ contrail/
   cost.py        dated price lookup, cost attribution, reconciliation
   prices.json    the price table -- data with effective dates, not code
   detectors.py   repeats, cost concentration, divergence, unhandled errors
-  cli.py         serve / runs / show / demo / parse / sessions / tree /
+  index.html     the screen -- one static file, no build step
+  cli.py         serve / traces / show / demo / parse / sessions / tree /
                  cost / reconcile / findings
-tests/           241 tests, including a canary per detector
+tests/           251 tests, including a canary per detector
 docs/spec.md     Why this exists and what the remaining phases are
 ```
 
@@ -261,7 +285,7 @@ one line, not migrating a database.
 | 2 | Subagent tree reconstruction | done |
 | 3 | Cost attribution per node | done |
 | 4 | Detectors | done |
-| 5 | The screen | next |
+| 5 | The screen | done |
 
 ## Development
 

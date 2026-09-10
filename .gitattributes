@@ -6,3 +6,6 @@
 
 # Recorded transcript fixtures are read byte-for-byte; never rewrite them.
 *.jsonl -text
+
+# Binary assets: never touch these.
+*.png binary

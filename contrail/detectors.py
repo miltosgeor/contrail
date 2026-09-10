@@ -233,6 +233,8 @@ def detect_redundant_repeats(
 
 DEFAULT_SHARE_THRESHOLD = 0.5      # a child holding this much of its parent
 DEFAULT_MIN_TOKENS = 50_000        # below this, concentration is not worth saying
+DEFAULT_MIN_SIBLINGS = 3           # fewer than this and a large share is arithmetic
+DEFAULT_MIN_TIMES_MEDIAN = 2.0     # how far above the typical sibling it must sit
 DESCEND_SHARE = 0.9                # follow an only-child holding this much
 
 
@@ -268,6 +270,8 @@ def detect_cost_concentration(
     run_cost: Any,
     share_threshold: float = DEFAULT_SHARE_THRESHOLD,
     min_tokens: int = DEFAULT_MIN_TOKENS,
+    min_siblings: int = DEFAULT_MIN_SIBLINGS,
+    min_times_median: float = DEFAULT_MIN_TIMES_MEDIAN,
     session_id: str = "",
 ) -> list[Finding]:
     """Nodes holding a disproportionate share of their parent's tokens.
@@ -276,11 +280,22 @@ def detect_cost_concentration(
     whatever price the caller already resolved -- no price lookup happens
     here. Needs no ground truth beyond arithmetic.
 
-    `share_threshold` is the fraction of a parent's inclusive tokens a single
-    child must hold. `min_tokens` is an absolute floor, so a node holding 90%
-    of a parent that consumed almost nothing never fires. **Both defaults are
-    calibrated against one corpus and are parameters for that reason.** Tune
-    them per project; do not read them as a rule.
+    Share alone is not concentration. With two children, one holding 50% or
+    more is close to arithmetically inevitable -- on the real corpus, share
+    alone produced 11 findings of which 7 were two-sibling workflows whose
+    "dominant" child was only 1.01x to 1.91x its single sibling. Those are
+    not insights, and they buried the findings that were. So a node must also
+    sit clear of the *typical* sibling, among enough siblings for "typical"
+    to mean anything.
+
+    - `share_threshold`  fraction of the parent's inclusive tokens
+    - `min_tokens`       absolute floor, so 90% of almost nothing never fires
+    - `min_siblings`     below this, a large share carries no information
+    - `min_times_median` how far above the median sibling it must sit
+
+    **Every default is calibrated against one corpus, not derived from a
+    principle**, and each is reported in the finding's evidence for that
+    reason. Tune them per project; do not read them as rules.
     """
     nodes = run_cost.nodes
     children: dict[str | None, list[Any]] = {}
@@ -294,7 +309,7 @@ def detect_cost_concentration(
             parent.total_tokens.billable_total if parent is not None
             else sum(s.total_tokens.billable_total for s in siblings)
         )
-        if parent_tokens < min_tokens or len(siblings) < 2:
+        if parent_tokens < min_tokens or len(siblings) < min_siblings:
             continue
 
         shares = [
@@ -307,6 +322,12 @@ def detect_cost_concentration(
         for node, share in shares:
             tokens = node.total_tokens.billable_total
             if share < share_threshold or tokens < min_tokens:
+                continue
+            # A median of zero means most siblings did essentially nothing,
+            # which is concentration by any reading -- treat it as unbounded
+            # rather than skipping it for being undefined.
+            times_median = (tokens / median) if median else float("inf")
+            if times_median < min_times_median:
                 continue
             culprit, via = _most_specific(node, children)
             enclosing = f"{parent.kind} {parent.label[:28]!r}" if parent else "run"
@@ -326,12 +347,14 @@ def detect_cost_concentration(
                     "siblings": len(siblings),
                     "sibling_median_tokens": median,
                     "times_sibling_median": (
-                        round(tokens / median, 2) if median else None
+                        round(times_median, 2) if median else "no typical sibling"
                     ),
                     "total_usd": node.total_usd,
                     "unpriced_records": node.unpriced_records,
                     "share_threshold": share_threshold,
                     "min_tokens": min_tokens,
+                    "min_siblings": min_siblings,
+                    "min_times_median": min_times_median,
                     "thresholds_note": (
                         "defaults calibrated against one corpus, not derived "
                         "from a principle; tune per project"
