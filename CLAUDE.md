@@ -16,7 +16,7 @@ change.
 
 ## Current state
 
-Phases 1-4 complete. 213 tests pass. The detectors run against real traces,
+Phases 1-4 complete. 241 tests pass. The detectors run against real traces,
 which was the condition for starting Phase 5.
 
 | Phase | | Status |
@@ -29,7 +29,8 @@ which was the condition for starting Phase 5.
 
 **Phase 4's labelled sets are small and every claim about them is quoted with
 its size.** Redundant repeats: 22 groups, 6 positive, 15 negative, 1
-undecidable. Unhandled errors: 14 findings hand-labelled, precision 3/14.
+undecidable. Unhandled errors: precision 3 of 4 after excluding two benign
+error classes, up from 3 of 14 before -- on a sample of four.
 Outcome divergence: 25 real verifier triples, 3 split, 22 agreed. Path-diff
 divergence was dropped on evidence -- see the negative result in
 `docs/spec.md`.
@@ -210,8 +211,14 @@ Different phenomena, different remedies; lumping them makes the detector look
 noisier than it is. `backgroundTaskId` is the discriminator.
 
 **Quote the sample size wherever precision is reported.** 22 repeat groups
-and 14 labelled error findings are not validation at scale, and must never be
+and 4 labelled error findings are not validation at scale, and must never be
 presented as if they were.
+
+**Harness error templates are boilerplate, not content.** The fixed strings
+the CLI emits on failure are neither prompt text nor tool arguments, so
+matching them is allowed where storing a message would not be — but only the
+resulting short class label is stored, never the text. That distinction is
+what took `unhandled_errors` precision from 3/14 to 3/4.
 
 ## Working notes for Phase 2 -- done, kept for context
 
@@ -243,9 +250,42 @@ ruff check .
 ```
 
 Tests use no network and write no files outside `tmp_path`. Every bug fixed
-gets a test that would have caught it. Detectors in Phase 4 must be pure
-functions over a run tree, tested against recorded fixtures — that is what
-makes this repo read as engineering rather than scripting.
+gets a test that would have caught it. Detectors are pure functions over a
+run tree, tested against recorded fixtures.
+
+### Every detector and extraction path needs a canary
+
+**A test that passes when the code finds nothing is not a test.** Every bug
+this project has had produced silently wrong output rather than a crash:
+
+| Bug | What it did | What complained |
+| --- | --- | --- |
+| `ALIASES` missed the emitted attribute names | every real span stored zero tokens | nothing |
+| Subagent records folded in twice | every subagent's cost doubled | nothing |
+| `result_hash` read off the tool_use record | repeat detector found nothing, reported all undecidable | nothing |
+| `toolUseResult` hashed only as a dict | every failed call looked like it had no result | nothing |
+
+So: **every detector and every extraction path carries a canary in
+`tests/test_canaries.py` that asserts it fires on a known positive, with the
+expected value, end to end.** End to end matters — three of those four bugs
+lived in the seams between parsing, tree building and detection, and were
+invisible to unit tests whose fixtures started halfway through. A canary
+builds JSONL on disk and runs `load_session` → `build_tree` → the store →
+the detector.
+
+Each canary is paired with a negative where one exists, so a detector that
+fires on everything fails too. Adding a detector without a canary fails
+`test_canary_every_detector_has_a_positive_in_this_file`.
+
+### Guard the lists that rot silently
+
+`VOLATILE_RESULT_KEYS` and `ERROR_TEMPLATES` both match strings the harness
+emits, so both go stale when it changes wording — and both fail *quietly*:
+repeats stop being detected, benign errors stop being recognised, and no
+test breaks. Each has a guard that hashes or classifies a recorded pair and
+fails on divergence, plus a cross-check that every name referenced elsewhere
+is one the list can actually produce. `unclassified_errors` travels on every
+finding as the in-use drift signal.
 
 ## Environment
 

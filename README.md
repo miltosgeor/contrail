@@ -170,16 +170,21 @@ than no finding.
 
 **What is measured, and on how little.** The labelled sets are small and are
 quoted with their size everywhere they appear: 22 repeat groups (6 positive,
-15 negative, 1 undecidable), 14 hand-labelled unhandled-error findings
-(precision **3 of 14**), 25 verifier triples (3 split, 22 agreed). None of
-that is validation at scale.
+15 negative, 1 undecidable), 4 hand-labelled unhandled-error findings
+(precision **3 of 4**, up from 3 of 14 before two benign error classes were
+excluded), 25 verifier triples (3 split, 22 agreed). None of that is
+validation at scale, and 75% of four proves very little.
 
 `unhandled_errors` reports a *shape*, never a verdict — it does not claim the
-agent ignored anything. Of its 14 labelled findings, 6 were tools the user
-declined at the permission prompt and 4 were reads probing for a file that
-does not exist, where moving on is exactly correct. The two thresholds on
-cost concentration are corpus-tuned defaults exposed as `--share-threshold`
-and `--min-tokens`, not rules.
+agent ignored anything. It excludes two classes where continuing is correct:
+a tool the user declined, and a probe for a file that does not exist. The two
+thresholds on cost concentration are corpus-tuned defaults exposed as
+`--share-threshold` and `--min-tokens`, not rules.
+
+Every bug this project has had produced silently wrong output rather than a
+crash, so every detector and extraction path carries a **canary** asserting it
+fires on a known positive, end to end — a test that passes when the code finds
+nothing is not a test.
 
 ## A negative result we kept
 
@@ -233,7 +238,7 @@ contrail/
   detectors.py   repeats, cost concentration, divergence, unhandled errors
   cli.py         serve / runs / show / demo / parse / sessions / tree /
                  cost / reconcile / findings
-tests/           213 tests, no network, nothing written outside tmp_path
+tests/           241 tests, including a canary per detector
 docs/spec.md     Why this exists and what the remaining phases are
 ```
 
