@@ -26,8 +26,9 @@ What the detectors do and do not claim:
 - `detect_unhandled_errors` reports a *shape*, never a verdict. Some errors
   are informative and moving on is correct behaviour; a detector that calls
   those a failure is wrong. It is a structural proxy, labelled one, and its
-  precision was measured at 3 of 14 hand-labelled findings. Low confidence is
-  a property of the rule, not a placeholder to be tuned away.
+  precision was measured at 3 of 4 hand-labelled findings after excluding two
+  benign error classes, up from 3 of 14 before. A sample of four proves very
+  little, so it stays low confidence.
 """
 
 from __future__ import annotations
@@ -56,6 +57,19 @@ HIGH = "high"        # follows from recorded data with no inference
 LOW = "low"          # a structural proxy; read the evidence before acting
 
 WRITER_TOOLS = frozenset({"Write", "Edit", "MultiEdit", "NotebookEdit"})
+
+# Error classes where not following up is the correct behaviour, so reporting
+# them as unhandled would be wrong. Both are harness-generated templates
+# classified at parse time -- see `classify_error` in transcript.py.
+#
+#   user_declined   the user said no at the permission prompt. There is
+#                   nothing for the agent to handle.
+#   file_not_found  a probe for a file that does not exist. Not touching it
+#                   again is exactly right.
+#
+# These two accounted for 10 of the 14 findings in the first hand-labelled
+# sample. Excluding them is what takes precision from 3/14 to 3/4.
+BENIGN_ERROR_CLASSES = frozenset({"user_declined", "file_not_found"})
 
 
 @dataclass
@@ -219,6 +233,35 @@ def detect_redundant_repeats(
 
 DEFAULT_SHARE_THRESHOLD = 0.5      # a child holding this much of its parent
 DEFAULT_MIN_TOKENS = 50_000        # below this, concentration is not worth saying
+DESCEND_SHARE = 0.9                # follow an only-child holding this much
+
+
+def _most_specific(node: Any, children: Mapping[str | None, list[Any]]) -> tuple[Any, list[str]]:
+    """Follow a single dominant child down to the node that really holds the cost.
+
+    Concentration is *decided* by comparing siblings, but the node worth
+    naming is often deeper: an `Agent` tool call has exactly one child, the
+    subagent that did the work, so stopping at the tool call reports the
+    mechanism instead of the culprit. "One Explore subagent burned the
+    budget" is the useful sentence, and this is what makes the finding say it.
+
+    Only descends through an only-child that holds essentially all of its
+    parent, so nothing is attributed to a node that did not cause it.
+    """
+    chain: list[str] = []
+    current = node
+    while True:
+        kids = children.get(current.node_id, ())
+        if len(kids) != 1:
+            return current, chain
+        child = kids[0]
+        parent_tokens = current.total_tokens.billable_total
+        if not parent_tokens:
+            return current, chain
+        if child.total_tokens.billable_total / parent_tokens < DESCEND_SHARE:
+            return current, chain
+        chain.append(f"{current.kind}:{current.label[:30]}")
+        current = child
 
 
 def detect_cost_concentration(
@@ -265,14 +308,18 @@ def detect_cost_concentration(
             tokens = node.total_tokens.billable_total
             if share < share_threshold or tokens < min_tokens:
                 continue
+            culprit, via = _most_specific(node, children)
+            enclosing = f"{parent.kind} {parent.label[:28]!r}" if parent else "run"
             findings.append(Finding(
                 detector=COST_CONCENTRATION,
                 summary=(
-                    f"{node.kind} {node.label[:60]!r} holds {share:.0%} of its "
-                    f"parent's tokens ({tokens:,} of {parent_tokens:,})"
+                    f"{culprit.kind} {culprit.label[:50]!r} holds {share:.0%} of "
+                    f"{enclosing} ({tokens:,} of {parent_tokens:,} tokens)"
                 ),
-                node_id=node.node_id, session_id=session_id,
+                node_id=culprit.node_id, session_id=session_id,
                 evidence={
+                    "attributed_via": via,
+                    "flagged_node": node.node_id,
                     "share_of_parent": round(share, 4),
                     "tokens": tokens,
                     "parent_tokens": parent_tokens,
@@ -362,28 +409,32 @@ def detect_unhandled_errors(
     -- and continuing is then the correct behaviour. A detector that called
     those failures would be wrong more often than right.
 
-    A structural proxy, marked `confidence=low`, and measurably so. All 14
-    findings it produced on the real corpus (from 311 `is_error` results) were
-    hand-labelled:
+    A structural proxy, marked `confidence=low`, and measured rather than
+    assumed. Two classes of failure where continuing is correct behaviour are
+    excluded -- a tool the user declined, and a probe for a file that does not
+    exist -- recognised by their harness error template at parse time.
 
-        3   worth attention -- an abandoned write, a write blocked by an
-            unavailable tool, a malformed search never retried
-        1   ambiguous -- a ripgrep timeout, possibly answered another way
-        6   benign -- the user declined the tool at the permission prompt
-        4   benign -- a Read probing for a file that does not exist, where
-            not touching it again is exactly correct
+    Hand-labelling the findings on the real corpus, out of 311 `is_error`
+    results:
 
-    So precision against "worth a human's attention" is **3 of 14 (21%)**, or
-    4 of 14 if the timeout counts. Reported rather than tuned away, because
-    the two dominant benign classes are not separable from structure alone:
-    `toolDenialKind` marks only 9 of 249 errors, so user rejections cannot be
-    filtered out without reading the message, and content capture is off by
-    default.
+        before excluding benign classes    3 of 14 worth attention  (21%)
+        after                              3 of  4 worth attention  (75%)
+
+    The surviving four are a write blocked by an unavailable tool, a write
+    that never followed its required read, a malformed search never retried,
+    and a ripgrep timeout that is genuinely ambiguous -- so 4 of 4 if the
+    timeout counts. **Sample size 4.** That is a handful of findings from one
+    corpus, not validation, and the rule stays `confidence=low` because 75%
+    of four proves very little.
+
+    Note what did *not* work: `toolDenialKind` marks only 9 of 249 errors, so
+    declines cannot be recognised structurally. The error templates can be
+    matched instead because they are harness boilerplate -- fixed strings the
+    CLI emits, not prompt text or tool arguments -- so only the resulting
+    class label is stored, never the message.
 
     Read the evidence on each finding. This is a shape worth looking at, not
     a defect list.
-
-    It needs no message content, comparing target hashes only.
 
     Errors whose call names no target are skipped rather than guessed at --
     a failed shell command has no target to follow up on, so the proxy has
@@ -400,11 +451,18 @@ def detect_unhandled_errors(
 
     findings: list[Finding] = []
     skipped_no_target = 0
+    benign = 0
+    unclassified = 0
 
     for index, call in enumerate(ordered):
         result = results.get(_field(call, "tool_use_id"))
         if result is None or not _field(result, "is_error"):
             continue
+        error_class = _field(result, "error_class")
+        if error_class in BENIGN_ERROR_CLASSES:
+            benign += 1
+            continue
+
         target = _field(call, "target_hash")
         if not target:
             skipped_no_target += 1
@@ -416,6 +474,9 @@ def detect_unhandled_errors(
         ]
         if later:
             continue
+
+        if error_class in (None, "other"):
+            unclassified += 1
 
         node = record_scope.get(_field(call, "uuid") or "")
         tool = _field(call, "tool_name") or "?"
@@ -429,6 +490,7 @@ def detect_unhandled_errors(
             record_uuids=(_field(call, "uuid"),),
             evidence={
                 "tool": tool,
+                "error_class": error_class,
                 "target_hash": target,
                 "later_calls_on_target": 0,
                 "position": index,
@@ -440,14 +502,18 @@ def detect_unhandled_errors(
                 ),
                 "skipped_errors_without_a_target": skipped_no_target,
                 "measured_precision": (
-                    "3 of 14 hand-labelled findings were worth attention "
-                    "(21%); 6 were user-declined tools and 4 were probes for "
-                    "a file that does not exist"
+                    "3 of 4 hand-labelled findings worth attention (75%) "
+                    "after excluding benign classes, up from 3 of 14; "
+                    "sample size 4, so treat as indicative only"
                 ),
             },
         ))
     for finding in findings:
         finding.evidence["skipped_errors_without_a_target"] = skipped_no_target
+        finding.evidence["benign_errors_excluded"] = benign
+        # A rising share here means the error templates have drifted and
+        # benign classes are no longer being recognised.
+        finding.evidence["unclassified_errors"] = unclassified
     return findings
 
 

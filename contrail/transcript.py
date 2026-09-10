@@ -91,6 +91,54 @@ VOLATILE_RESULT_KEYS = frozenset({
     "persistedOutputSize",
 })
 
+# --- error classification -------------------------------------------------
+#
+# Harness-generated error templates. These are tooling boilerplate -- fixed
+# strings the CLI emits -- not prompt text and not tool arguments, so matching
+# them does not cross the no-content-by-default line. Only the resulting short
+# class label is ever stored; the message itself is not.
+#
+# Matched as substrings against the start of the result, longest-lived
+# templates first. Counts are occurrences in the September 2026 corpus.
+ERROR_CLASS_USER_DECLINED = "user_declined"
+ERROR_CLASS_FILE_NOT_FOUND = "file_not_found"
+ERROR_CLASS_READ_BEFORE_WRITE = "read_before_write"
+ERROR_CLASS_SCHEMA_MISMATCH = "schema_mismatch"
+ERROR_CLASS_BLOCKED = "blocked_by_policy"
+ERROR_CLASS_TOOL_UNAVAILABLE = "tool_unavailable"
+ERROR_CLASS_OTHER = "other"
+
+ERROR_TEMPLATES: tuple[tuple[str, str], ...] = (
+    # (class, substring). 27 occurrences.
+    (ERROR_CLASS_USER_DECLINED, "The user doesn't want to proceed with this tool use"),
+    # 8 occurrences. The message continues with the working directory, which
+    # is why only the stable prefix is matched.
+    (ERROR_CLASS_FILE_NOT_FOUND, "File does not exist."),
+    # 16 occurrences.
+    (ERROR_CLASS_READ_BEFORE_WRITE, "File has not been read yet"),
+    # 28 occurrences.
+    (ERROR_CLASS_SCHEMA_MISMATCH, "Output does not match required schema"),
+    (ERROR_CLASS_BLOCKED, "is blocked. This path is protected"),
+    (ERROR_CLASS_TOOL_UNAVAILABLE, "No such tool available"),
+)
+
+
+def classify_error(text: Any) -> str | None:
+    """Which harness error template a failed result matches, if any.
+
+    Returns a short label, never the message. `other` means the result was an
+    error we have no template for -- distinct from None, which means the call
+    did not fail. A rising `other` count is the signal that these templates
+    have drifted; see tests/test_detectors.py for the guard.
+    """
+    if not isinstance(text, str) or not text:
+        return None
+    for label, needle in ERROR_TEMPLATES:
+        if needle in text:
+            return label
+    return ERROR_CLASS_OTHER
+
+
 # A background task's output file. The id in the path is the same id the
 # launching call reports as `backgroundTaskId`, which is what lets a re-read
 # of a still-running task be told apart from a genuinely redundant one.
@@ -320,6 +368,8 @@ class TranscriptRecord:
     # --- tool result (user) --------------------------------------------
     is_tool_result: bool = False
     is_error: bool = False
+    # Which harness error template the failure matched. A label, not the text.
+    error_class: str | None = None
     result_hash: str | None = None
     result_status: str | None = None
     result_agent_id: str | None = None
@@ -458,6 +508,8 @@ def parse_record(raw: dict[str, Any]) -> TranscriptRecord | None:
             rec.is_error = block.get("is_error") is True
             body = block.get("content")
             text_len += len(body) if isinstance(body, str) else 0
+            if rec.is_error:
+                rec.error_class = classify_error(body)
             if keep_content and isinstance(body, str):
                 rec.content = body
 
@@ -470,6 +522,12 @@ def parse_record(raw: dict[str, Any]) -> TranscriptRecord | None:
     rec.text_len = text_len
 
     tur = raw.get("toolUseResult")
+    if rec.is_error and rec.error_class in (None, ERROR_CLASS_OTHER):
+        # On error `toolUseResult` is itself the message, and it sometimes
+        # carries a template the result block did not.
+        fallback = classify_error(tur)
+        if fallback not in (None, ERROR_CLASS_OTHER):
+            rec.error_class = fallback
     if tur is not None:
         rec.result_hash = result_hash(tur)
         rec.background_task_id = rec.background_task_id or background_task_id(None, tur)

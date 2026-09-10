@@ -17,8 +17,10 @@ import pytest
 from contrail import detectors as D
 from contrail.cost import PriceTable, Tokens, attribute_cost
 from contrail.transcript import (
+    ERROR_TEMPLATES,
     VOLATILE_RESULT_KEYS,
     background_task_id,
+    classify_error,
     result_hash,
     target_hash,
     tool_signature,
@@ -43,6 +45,7 @@ class Rec:
     result_hash: str | None = None
     is_tool_result: bool = False
     is_error: bool = False
+    error_class: str | None = None
     model: str = "claude-opus-5"
     service_tier: str = "standard"
     input_tokens: int = 0
@@ -529,3 +532,133 @@ def test_detectors_are_pure_and_do_not_mutate_their_input():
     before = [(r.uuid, r.result_hash, r.tool_signature) for r in recs]
     D.run_all(recs, scope("c1", "c2"))
     assert [(r.uuid, r.result_hash, r.tool_signature) for r in recs] == before
+
+
+# ------------------------------------- the error-template rot guard
+#
+# Same failure mode as VOLATILE_RESULT_KEYS: the harness rewords an error,
+# our template stops matching, benign classes stop being recognised, and
+# unhandled_errors quietly goes back to reporting mostly noise. Nothing
+# crashes. These are the guard.
+#
+# The strings below are recorded verbatim from the real corpus. They are
+# harness boilerplate -- fixed text the CLI emits -- not prompt text or tool
+# arguments, which is why quoting them here does not carry content.
+
+RECORDED_ERRORS = {
+    "user_declined": (
+        "The user doesn't want to proceed with this tool use. The tool use "
+        "was rejected (eg. if it was a file edit, the new_string was not "
+        "applied)."
+    ),
+    "file_not_found": (
+        "File does not exist. Note: your current working directory is /p"
+    ),
+    "read_before_write": (
+        "<tool_use_error>File has not been read yet. Read it first before "
+        "writing to it.</tool_use_error>"
+    ),
+    "schema_mismatch": (
+        "Output does not match required schema: root: must have required "
+        "property 'findings'"
+    ),
+    "tool_unavailable": (
+        "<tool_use_error>Error: No such tool available: Write. Write exists "
+        "but is not enabled in this context.</tool_use_error>"
+    ),
+    "blocked_by_policy": (
+        "Remove-Item on system path '/' is blocked. This path is protected "
+        "from removal."
+    ),
+}
+
+
+@pytest.mark.parametrize(("expected", "text"), sorted(RECORDED_ERRORS.items()))
+def test_recorded_error_templates_still_classify(expected, text):
+    """If this fails the harness has reworded an error and the template needs
+    updating -- until then, that class silently stops being recognised."""
+    assert classify_error(text) == expected
+
+
+def test_an_unrecognised_error_is_other_not_none():
+    """`other` and None mean different things: an error we have no template
+    for, versus a call that did not fail at all."""
+    assert classify_error("Exit code 1\nTraceback (most recent call last):") == "other"
+    assert classify_error(None) is None
+    assert classify_error("") is None
+
+
+def test_every_benign_class_is_one_a_template_can_produce():
+    """A rename in one place and not the other would silently stop the
+    filtering, with no test failing and precision quietly dropping."""
+    producible = {label for label, _needle in ERROR_TEMPLATES}
+    unknown = D.BENIGN_ERROR_CLASSES - producible
+    assert unknown == set(), (
+        f"BENIGN_ERROR_CLASSES names {unknown}, which no template produces"
+    )
+
+
+def test_the_benign_classes_are_the_two_that_were_measured():
+    """Widening this set changes a published precision figure, so changing it
+    should require changing this test and re-measuring."""
+    assert D.BENIGN_ERROR_CLASSES == {"user_declined", "file_not_found"}
+
+
+def test_a_declined_tool_is_not_reported_as_unhandled():
+    """The user said no. There is nothing for the agent to have handled."""
+    recs = [
+        call("c1", "Write", "t1", target="/a.py", at=0),
+        Rec(uuid="r1", ts_ns=1, tool_use_id="t1", is_tool_result=True,
+            result_hash="e", is_error=True, error_class="user_declined"),
+    ]
+    assert D.detect_unhandled_errors(recs, scope("c1")) == []
+
+
+def test_a_probe_for_a_missing_file_is_not_reported_as_unhandled():
+    recs = [
+        call("c1", "Read", "t1", target="/nope.py", at=0),
+        Rec(uuid="r1", ts_ns=1, tool_use_id="t1", is_tool_result=True,
+            result_hash="e", is_error=True, error_class="file_not_found"),
+    ]
+    assert D.detect_unhandled_errors(recs, scope("c1")) == []
+
+
+def test_a_genuinely_abandoned_write_is_still_reported():
+    """The benign filter must not swallow the cases worth seeing."""
+    recs = [
+        call("c1", "Write", "t1", target="/a.py", at=0),
+        Rec(uuid="r1", ts_ns=1, tool_use_id="t1", is_tool_result=True,
+            result_hash="e", is_error=True, error_class="read_before_write"),
+    ]
+    found = D.detect_unhandled_errors(recs, scope("c1"))
+    assert len(found) == 1
+    assert found[0].evidence["error_class"] == "read_before_write"
+
+
+def test_excluded_and_unclassified_counts_are_reported():
+    """A rising unclassified share is the in-use signal that templates have
+    drifted, so it travels on every finding."""
+    recs = [
+        call("c0", "Write", "t0", target="/x.py", at=0),
+        Rec(uuid="r0", ts_ns=1, tool_use_id="t0", is_tool_result=True,
+            result_hash="e", is_error=True, error_class="user_declined"),
+        call("c1", "Write", "t1", target="/a.py", at=2),
+        Rec(uuid="r1", ts_ns=3, tool_use_id="t1", is_tool_result=True,
+            result_hash="e", is_error=True, error_class="other"),
+    ]
+    found = D.detect_unhandled_errors(recs, scope("c0", "c1"))
+    assert len(found) == 1
+    assert found[0].evidence["benign_errors_excluded"] == 1
+    assert found[0].evidence["unclassified_errors"] == 1
+
+
+def test_the_published_precision_travels_with_its_sample_size():
+    recs = [
+        call("c1", "Write", "t1", target="/a.py", at=0),
+        Rec(uuid="r1", ts_ns=1, tool_use_id="t1", is_tool_result=True,
+            result_hash="e", is_error=True, error_class="read_before_write"),
+    ]
+    text = D.detect_unhandled_errors(recs, scope("c1"))[0].evidence[
+        "measured_precision"]
+    assert "3 of 4" in text
+    assert "sample size 4" in text
