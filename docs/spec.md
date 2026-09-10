@@ -46,11 +46,11 @@ Verified against current docs. Nothing here needs building — it needs joining.
 | Surface | Status | Carries | Use for |
 | --- | --- | --- | --- |
 | OTel traces | Beta | `claude_code.interaction`, `.llm_request`, `.tool`, `.tool.execution`, `.hook` | Span skeleton and timings |
-| OTel metrics + logs | Stable | Token counters, cost, tool decisions, API errors | Aggregates, error rates |
+| OTel metrics + logs | Stable | `claude_code.cost.usage` (USD), `claude_code.token.usage`, session count, active time | Cross-checking our price table |
 | Hooks | Stable | `PreToolUse`, `PostToolUse`, `PostToolUseFailure`, `SubagentStart`, `SubagentStop` | Tool I/O and subagent lifecycle |
 | Session transcripts | Stable | JSONL: `uuid`/`parentUuid`, `agentId`, `tool_use_id`, per-message usage | Causal graph, replay |
-| Agent SDK stream | Stable | `ResultMessage.total_cost_usd`, `model_usage`, cache token split | Ground-truth cost |
-| Per-tool cost | **Absent** | — | Must be derived |
+| Agent SDK stream | Stable | `ResultMessage.total_cost_usd`, `model_usage`, cache token split | Not available on disk -- SDK-only, see below |
+| Per-tool cost | **Not measurable** | A tool call makes no API call | Derived attribution only |
 | Subagent internals | **Absent from traces** | Present in full as a separate transcript file per subagent | Must be reconstructed |
 
 ## The three gaps
@@ -75,10 +75,24 @@ sessions.*
 
 ### Gap 2 — Cost attribution
 
-Cost surfaces per model and per run, never per tool or per subagent.
-Attribute token deltas along the span tree so spend lands on the node that
-caused it — with cache reads and writes kept separate, since they price
+Cost surfaces per model and per run, never per subagent. Attribute tokens
+along the tree so spend lands on the node that caused it, with cache reads
+and the two cache-write TTLs kept separate, since all three price
 differently.
+
+**Node-level cost is measured. Per-tool cost is not, and the earlier version
+of this section implied otherwise.** A tool call makes no API call and has no
+cost of its own; what it causes is growth in the *next* request's input
+tokens. So run, turn and subagent cost are computed from recorded token
+counts, and per-tool cost is exposed as an explicitly-labelled *derived
+attribution* -- the input-token delta on the following request -- never
+presented as a measured figure.
+
+**Tokens are the stored truth; no dollar figure is ever written to the
+database.** Prices change, and a stored cost silently falsifies every
+historical run at the next pricing update. Cost is computed at query time
+from a price table with effective dates, so a run from March is still costed
+at March's prices.
 
 *Output: "this run cost $2.40, and $1.90 of it was one Explore subagent
 re-reading the same files."*
@@ -225,6 +239,143 @@ Real spans also carry `user.email`, `user.id` and `organization.id` in
 resource attributes. That is identity, not content, but it lands in the
 database and is worth knowing before sharing one.
 
+## Cost attribution, as verified
+
+Recorded September 2026 against live OTLP export at `service.version 2.1.266`
+and 148 real transcripts. As with the transcript format, this section is what
+was measured, not what was documented -- the previous version of this spec
+named a ground truth that does not exist on disk.
+
+### Where the numbers come from
+
+**Tokens come from transcripts. Timing and structure come from OTel.**
+
+Cost lives on `claude_code.llm_request` spans, and those spans carry **no**
+`tool_use_id` (0 of 103 measured) and no agent identity -- so the trace path
+alone cannot say which subagent spent what. Every `llm_request` span does
+carry `request_id`, and every transcript assistant record carries
+`requestId`. That is the join.
+
+| | Carries | Use for |
+| --- | --- | --- |
+| `llm_request` span | `request_id`, `model`, token counts, `duration_ms`, `ttft_ms` | timing |
+| Transcript assistant record | `requestId`, `agentId`, `message.usage` incl. TTL split | **tokens** |
+
+Transcripts win for tokens because they are scoped to an agent and traces are
+not, and because export can start mid-session: on the measured session, 21
+transcript records had no corresponding span, while only 1 span had no record.
+
+### Cross-source agreement
+
+Joining the two on `request_id` over one real session:
+
+```
+matched on request_id            104
+token counts agreeing            104 / 104   (input, output, cache read, cache creation)
+span-only  /  transcript-only      1  /  21
+```
+
+Two pipelines that share no code reporting identical counts is the strongest
+evidence available that the token inputs are right.
+
+### The usage record
+
+`message.usage` on an assistant record, with the fields that matter for
+pricing:
+
+| Field | Note |
+| --- | --- |
+| `input_tokens`, `output_tokens` | base counts |
+| `cache_read_input_tokens` | priced at ~0.1x input, same for both TTLs |
+| `cache_creation.ephemeral_5m_input_tokens` | priced at ~1.25x input |
+| `cache_creation.ephemeral_1h_input_tokens` | priced at ~2x input |
+| `output_tokens_details.thinking_tokens` | billed *within* `output_tokens`; store, never add |
+| `service_tier` | a price dimension; `standard` throughout the corpus |
+| `iterations[]` | per-attempt breakdown; sums to top-level on 10,578/10,578 records |
+
+**Cache creation is two numbers, not one.** Both TTLs occur heavily -- 1h on
+9,879 records, 5m on 2,104 -- and they price differently. An earlier note
+elsewhere in this repo said cache writes cost "~125%", which is true only of
+the 5m half. Collapsing them, as Phase 2's schema did, makes correct pricing
+impossible.
+
+`<synthetic>` appears as a model on harness-generated records. It is **not a
+real API call and is excluded from cost entirely**, not priced at zero.
+
+### The three reconciliation layers
+
+The earlier spec said to reconcile against `ResultMessage.total_cost_usd`.
+That is Agent SDK streaming state and **is not on disk**: searching all 148
+transcripts for `total_cost_usd`, `cost_usd`, `costUSD` and `totalCost` finds
+prose only and zero structured fields. So reconciliation is layered, and each
+layer is labelled with what it actually proves.
+
+**Layer 1 -- attribution invariant.** The sum of per-node self tokens equals
+the sum of tokens over the source records, per agent and per run. Pure
+arithmetic over the tree, unit-testable against fixtures. Catches
+double-counting, dropped orphans and mis-scoped records. **This is the
+correctness test.**
+
+**Layer 2 -- cross-source agreement.** Transcript tokens against
+`llm_request` span tokens, joined on `request_id`, as measured above.
+Independent evidence that the inputs are right.
+
+**Layer 3 -- agreement with Claude Code's own estimate.** The metrics stream
+carries `claude_code.cost.usage`, unit `USD`, a sum dimensioned by `model`,
+`query_source` and `effort`, alongside `claude_code.token.usage` dimensioned
+by `model`, `query_source` and `type` in {input, output, cacheRead,
+cacheCreation}. Confirmed present by capturing a real export.
+
+**This counter is Claude Code's own client-side estimate, computed from a
+price table bundled in the CLI. It is not a billing figure and must never be
+described as ground truth.** What Layer 3 proves is that *our* price table
+agrees with *theirs*, which is a genuine and useful check -- it catches our
+table going stale after a price change -- and nothing more. If the two
+disagree, either table could be the wrong one.
+
+Note also that the metrics stream's `cacheCreation` is a single number with
+no TTL split, so it is coarser than the transcript. Transcripts remain the
+token source; metrics are only the dollar cross-check.
+
+### Two known residuals
+
+Both are systematic, both are reported by name rather than absorbed into a
+tolerance.
+
+**Auxiliary model calls never appear in transcripts.** The cost counter
+reports `query_source: auxiliary` spend -- small Haiku calls for things like
+title generation -- against models that appear nowhere in the transcript. On
+the measured session the transcript contained 348 `claude-opus-5` records and
+zero Haiku records, while the counter billed Haiku. Transcript-derived cost
+therefore *undercounts* by the auxiliary calls, on the order of a fraction of
+a percent, and the gap is reported as `auxiliary_usd` rather than hidden.
+
+**Model names differ between sources.** The metrics stream reports
+`claude-opus-5[1m]`; the transcript reports `claude-opus-5` for the same
+calls. The `[1m]` suffix marks the long-context variant, which the transcript
+does not expose at all. Price lookup normalises the suffix away, so a
+long-context run may be priced at base rates and diverge from the counter --
+which is precisely the kind of disagreement Layer 3 exists to surface.
+
+### The price table
+
+Prices are **data with effective dates, not constants in code**: a
+`prices` table seeded from `contrail/prices.json`.
+
+- Cost is computed at query time from the row whose effective range contains
+  the *run's* start time, so historical runs stay correctly priced forever
+  and a price change is one appended row that rewrites nothing.
+- Every row cites its source URL and the date the figure was fetched.
+  `effective_from` is the date the figure was **confirmed**, never an earlier
+  date we would be guessing at.
+- An unknown model yields `NULL`, never `$0`, and the run reports
+  `unpriced_records: N` alongside its cost. A silent zero is how this phase
+  would lie, and the `ALIASES` bug already demonstrated the cost of one.
+- Every row holds the same ratios against its base input price -- cache read
+  0.1x, 5m write 1.25x, 1h write 2x, output 5x. A test asserts this across
+  the whole table, so a typo in a future row fails loudly instead of
+  quietly mispricing runs.
+
 ## Architecture
 
 Four pieces, deliberately boring.
@@ -266,7 +417,7 @@ tempting mistake and the reason these projects end up as frontends.
 | --- | --- | --- | --- |
 | 1 | **Ingest and store** | Point Claude Code at it, run a real task, see spans land in the database. | ~2 days |
 | 2 | **Reconstruct the tree** | A run with subagents renders as a correct nested tree. Transcript parser only -- no hook shim -- joined on `toolUseResult.agentId`, the workflow journal, and `uuid`/`parentUuid`. | ~3 days |
-| 3 | **Attribute cost** | Walk the tree assigning token deltas to nodes, cache reads and writes split. Reconcile the total against `ResultMessage.total_cost_usd` — that reconciliation is the correctness test. | ~2 days |
+| 3 | **Attribute cost** | Walk the tree assigning tokens to nodes, cache reads and both write TTLs split. Reconcile in three layers (see *Cost attribution, as verified*); the arithmetic invariant is the correctness test. | ~2 days |
 | 4 | **Detectors** | Loop detection, run-vs-run divergence, unacknowledged tool failures. Pure functions, unit tested against recorded fixtures. The intellectual core. | ~4 days |
 | 5 | **The screen** | Run list, tree view, cost breakdown, findings, diff. Now it earns the name "command center" — because there is something behind it worth commanding. | ~4 days |
 

@@ -14,7 +14,8 @@ actually cost you an afternoon:
 Contrail is the layer that answers those. The dashboard is the front end of a
 data model, not the product. Full reasoning in [`docs/spec.md`](docs/spec.md).
 
-**Status: Phase 1 of 5.** Ingest and store works. Analysis does not exist yet.
+**Status: Phase 2 of 5.** Ingest, store, and subagent tree reconstruction
+work. Cost attribution and the detectors do not exist yet.
 
 ---
 
@@ -62,6 +63,49 @@ Nothing is captured by default beyond structure — span names, durations,
 token counts. Tool arguments and prompt text only arrive if you opt in with
 `OTEL_LOG_TOOL_DETAILS=1` / `OTEL_LOG_USER_PROMPTS=1`. See `.env.example`.
 
+## Reconstructing subagent trees
+
+This path reads the JSONL transcripts Claude Code already writes to disk. It
+needs no collector and no telemetry enabled, and it is deliberately
+independent of the OTLP path -- trace export is behind a beta flag, and this
+keeps working if it moves.
+
+```bash
+contrail parse               # read session transcripts from disk
+contrail sessions            # list parsed sessions
+contrail tree cec62d6f       # print one reconstructed run tree
+```
+
+```
+session 64fef8c7-…
+|- turn 189
+|  `- tool Workflow                     998.3s          <pending>
+|     `- workflow wf_8c35c824-7c9       997.1s
+|        |- subagent workflow-subagent   49.8s  11,874tok  [workflow_journal]
+|        |- subagent workflow-subagent   26.5s  11,004tok  [workflow_journal]
+```
+
+Each subagent node records `link_basis` — which rule linked it to its parent
+— so a wrong tree stays debuggable. Structure only: tool calls are stored as
+a non-reversible normalised signature, never as argument text, unless you opt
+in with `CONTRAIL_CAPTURE_CONTENT=1`.
+
+## Cost, and what it is not
+
+Tokens are the stored truth. **No dollar figure is written to the database**,
+because prices change and a stored cost would silently falsify every
+historical run at the next pricing update. Cost is computed at query time
+from a price table with effective dates, so a run from March stays costed at
+March's prices.
+
+Claude Code's metrics stream also exports a `claude_code.cost.usage` counter
+in USD. **That figure is Claude Code's own client-side estimate, computed from
+a price table bundled in the CLI — it is not a billing figure**, and Contrail
+does not treat it as ground truth. Comparing against it checks that our price
+table has not gone stale relative to theirs; if the two disagree, either
+table could be the wrong one. Reconciliation against actual billing is not
+something any local tool can do.
+
 ## API
 
 | Route | Purpose |
@@ -79,8 +123,9 @@ contrail/
   otlp.py        OTLP/protobuf and OTLP/JSON decoding
   store.py       SQLite schema and queries
   collector.py   FastAPI app: ingest + read API
-  cli.py         serve / runs / show / demo
-tests/           41 tests, no network, no fixtures on disk
+  transcript.py  JSONL session parser and subagent tree reconstruction
+  cli.py         serve / runs / show / demo / parse / sessions / tree
+tests/           110 tests, no network, nothing written outside tmp_path
 docs/spec.md     Why this exists and what the remaining phases are
 ```
 
@@ -100,8 +145,8 @@ one line, not migrating a database.
 | Phase | | Status |
 | --- | --- | --- |
 | 1 | Ingest and store | done |
-| 2 | Subagent tree reconstruction | next |
-| 3 | Cost attribution per node | |
+| 2 | Subagent tree reconstruction | done |
+| 3 | Cost attribution per node | next |
 | 4 | Loop, divergence and silent-failure detectors | |
 | 5 | The screen | |
 

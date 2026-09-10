@@ -78,9 +78,19 @@ captures content unconditionally.
 **The `runs` table is materialised, not a view.** It is rebuilt whenever a
 trace gains spans. Keep `_refresh_run` the single place that happens.
 
-**Cache tokens stay separate from input tokens.** They price very differently
-(reads ~10%, writes ~125%), and Phase 3's cost attribution depends on the
-split. Never sum them together.
+**Cache tokens stay separate from input tokens, and cache writes are two
+numbers, not one.** Relative to base input: reads ~0.1x, 5-minute-TTL writes
+~1.25x, 1-hour-TTL writes ~2x. `message.usage.cache_creation` splits into
+`ephemeral_5m_input_tokens` and `ephemeral_1h_input_tokens` and both occur
+heavily on real data -- 1h on 9,879 records, 5m on 2,104. An earlier version
+of this line said writes cost "~125%", which is only the 5m half. Never sum
+any of them together.
+
+**No dollar figure is ever stored.** Tokens are the stored truth; cost is
+computed at query time from a dated price table in `contrail/prices.json`.
+Prices change, and a stored cost silently falsifies every historical run at
+the next pricing update. An unknown model yields NULL and a reported
+`unpriced_records` count, never $0.
 
 ## Conventions established by Phase 2 -- keep these
 
