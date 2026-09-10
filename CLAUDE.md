@@ -78,14 +78,20 @@ split. Never sum them together.
 
 The goal is to nest subagent work under the run that spawned it.
 
-- `SubagentStart` / `SubagentStop` hooks fire but carry no nested spans. The
-  link has to be reconstructed by joining hook events and transcript records
-  on `tool_use_id`, and messages to each other on `parent_message_id`.
-- **Read a real transcript before writing the parser.** The JSONL format is
-  only partly documented — much of what is written about it is community
-  reverse-engineering. Find an actual session file under the Claude Code data
-  directory and parse what is genuinely there, not what a doc claims. If the
-  real format differs from `docs/spec.md`, the file wins — update the spec.
+- The format has now been read off disk and written up in
+  `docs/spec.md` under **Transcript format, as verified** — 5 sessions and
+  148 subagent transcripts, CLI 2.1.121–2.1.266. Trust that section over any
+  community documentation, and over anything this file said before it.
+- **No hook shim is needed.** The transcripts are self-sufficient: the parent
+  records `toolUseResult.agentId` and workflow runs record membership in
+  `journal.jsonl`. Hooks would add a moving part for no new information.
+- The DAG edge is `uuid` / `parentUuid`. There is no `parent_message_id`.
+- Subagents live in their **own files** under `<session>/subagents/`, with
+  `isSidechain: true` and the parent's `sessionId`. Never inline.
+- Joining on `tool_use_id` alone finds 15% of the tree — only 22 of 148
+  `.meta.json` files carry it. Resolve `Agent` spawns by
+  `toolUseResult.agentId` and `Workflow` spawns by journal membership; record
+  which rule fired in `link_basis` so a wrong tree stays debuggable.
 - Keep the transcript parser as an **independent path** from the OTel
   ingest. Trace export is behind a beta flag and span names can change; the
   tool must still work if that shifts.

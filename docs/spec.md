@@ -48,10 +48,10 @@ Verified against current docs. Nothing here needs building — it needs joining.
 | OTel traces | Beta | `claude_code.interaction`, `.llm_request`, `.tool`, `.tool.execution`, `.hook` | Span skeleton and timings |
 | OTel metrics + logs | Stable | Token counters, cost, tool decisions, API errors | Aggregates, error rates |
 | Hooks | Stable | `PreToolUse`, `PostToolUse`, `PostToolUseFailure`, `SubagentStart`, `SubagentStop` | Tool I/O and subagent lifecycle |
-| Session transcripts | Stable | JSONL: message ids, `parent_message_id`, `tool_use_id`, per-message usage | Causal graph, replay |
+| Session transcripts | Stable | JSONL: `uuid`/`parentUuid`, `agentId`, `tool_use_id`, per-message usage | Causal graph, replay |
 | Agent SDK stream | Stable | `ResultMessage.total_cost_usd`, `model_usage`, cache token split | Ground-truth cost |
 | Per-tool cost | **Absent** | — | Must be derived |
-| Subagent internals | **Absent** | Start/stop only, no nested spans | Must be reconstructed |
+| Subagent internals | **Absent from traces** | Present in full as a separate transcript file per subagent | Must be reconstructed |
 
 ## The three gaps
 
@@ -62,9 +62,13 @@ doesn't, it's a dashboard.
 
 ### Gap 1 — Subagent tree reconstruction
 
-`SubagentStart` and `SubagentStop` fire, but nothing links a subagent's
-internal work back to the parent run. Join hook events to transcript records
-on `tool_use_id` and rebuild the real tree.
+Traces carry no nested spans for subagent work, so nothing in the telemetry
+links a subagent back to the parent run. The transcripts do: each subagent
+gets its own JSONL file, and the parent records the link. Rebuild the tree
+from those files alone -- see *Transcript format, as verified* below.
+
+No hook shim is required for this. That is a change from the original plan
+and it removes a moving part rather than adding one.
 
 *Output: a run renders as one nested tree, not a flat list of disconnected
 sessions.*
@@ -110,13 +114,125 @@ run 7f3a·"reconcile monthly exports"          142.8s   $2.41
 vs. run 6b21 (same task)  ── diverged at turn 2, tool 3
 ```
 
+## Transcript format, as verified
+
+Recorded against a real Claude Code data directory in September 2026: 5
+session transcripts and 148 subagent transcripts, CLI versions 2.1.121 to
+2.1.266. Where this contradicts community documentation, this section is what
+was actually on disk. It replaces an earlier description of this format that
+was written from docs and was wrong in four places.
+
+### Layout
+
+One directory per project under `~/.claude/projects/<path-slug>/`, one
+`<session-id>.jsonl` per session. `sessionId` is constant within a file, so
+file and session are the same thing. Subagents are **separate files**, never
+inline in the parent:
+
+```
+<session-id>.jsonl                       parent session
+<session-id>/
+  subagents/
+    agent-<agentId>.jsonl                one direct subagent
+    agent-<agentId>.meta.json            {agentType, description?, toolUseId?, spawnDepth?}
+    workflows/wf_<runId>/
+      agent-<agentId>.jsonl              workflow-spawned subagents
+      journal.jsonl                      {type: started|result, key, agentId, result?}
+  tool-results/                          overflow for large tool results
+```
+
+### Records
+
+Newline-delimited JSON, one object per line, 12 observed `type` values. Only
+`assistant` and `user` carry a `message`; the other ten (`attachment`,
+`ai-title`, `last-prompt`, `mode`, `queue-operation`,
+`file-history-snapshot`, `file-history-delta`, `atis-latch`,
+`bridge-session`, `system`) are harness bookkeeping and are skipped.
+
+| Field | On | Meaning |
+| --- | --- | --- |
+| `uuid` | all | record identity |
+| `parentUuid` | all | previous record. **This is the DAG edge**, `null` at the root |
+| `isSidechain` | all | `false` in a parent session, `true` in every subagent record |
+| `agentId` | subagent records | equals the filename stem, on every line |
+| `sessionId` | all | the **parent's** session id, even inside subagent files |
+| `sourceToolAssistantUUID` | tool_result records | uuid of the assistant record that made the call |
+| `toolUseResult` | tool_result records | harness-side result detail |
+| `message.usage` | assistant | token counts incl. cache read/creation and a 5m/1h ephemeral split |
+| `attributionAgent` | subagent assistant records | agent type, as a string |
+
+There is no `parent_message_id` and no `message id` linking field; the earlier
+spec named both. The edge is `uuid`/`parentUuid`.
+
+### Tool calls and results
+
+A call is a `tool_use` block on an `assistant` record. Its result is a
+`tool_result` block on a **`user`** record -- the harness replays results as
+user turns. They join on `tool_use_id`.
+
+Measured: exactly one `tool_use` block per assistant record and one
+`tool_result` per user record across all 5,282 calls. Parallel tool calls are
+written as separate records, not batched into one. `parentUuid ==
+sourceToolAssistantUUID` on all 5,280 tool_result records, so the uuid chain
+and the tool-call chain agree. 5,282 calls to 5,280 results -- unmatched calls
+are the interrupted case and must not be fatal.
+
+### How a subagent links to its parent
+
+Two spawn mechanisms, different link paths. This is the part most worth
+getting right, because the obvious join covers a small minority of files.
+
+**`Agent` tool.** The parent's `toolUseResult` carries `{status, agentId,
+agentType, prompt}`, and `agentId` is the filename stem. The `.meta.json`
+carries `toolUseId` pointing back at the `tool_use` block. Two redundant
+joins.
+
+**`Workflow` tool.** Returns `status: "async_launched"` with `runId` and an
+absolute `transcriptDir`. Its children's `.meta.json` files contain only
+`{"agentType": "workflow-subagent"}` -- **no `toolUseId` at all**. Membership
+comes from `journal.jsonl`, which names every `agentId` in the run and pairs
+`started` with `result`. Workflows fan out flat: the journal carries no
+agent-to-agent edge, so children nest under the `Workflow` tool node, not
+under each other.
+
+Why this matters: only **22 of 148** `.meta.json` files carry `toolUseId`, so
+joining on `tool_use_id` alone -- the original plan -- would have found 15% of
+the tree. Measured coverage:
+
+| Path | Files resolved |
+| --- | --- |
+| `toolUseResult.agentId` in parent (`Agent`) | 24 |
+| `journal.jsonl` membership (`Workflow`) | 124 |
+| **Total** | **148 of 148, zero orphans** |
+
+Directory containment is kept as a last-resort fallback, but on this corpus it
+never fires.
+
+### Trace-side join keys
+
+Verified against live OTLP export at `service.version 2.1.266`: real spans do
+carry `session.id`, and `claude_code.tool` / `.tool.execution` spans also carry
+`tool_use_id` and `gen_ai.tool.call.id`. So trace-to-transcript reconciliation
+is available per tool call, not merely per session. Phase 3 can rely on it.
+
+Note that real spans emit **bare** attribute names -- `tool_name`,
+`input_tokens`, `output_tokens`, `cache_read_tokens`,
+`cache_creation_tokens` -- alongside the `gen_ai.*` ones, and for tokens the
+bare names are the only ones present. `ALIASES` must list them or every token
+count reads zero.
+
+Real spans also carry `user.email`, `user.id` and `organization.id` in
+resource attributes. That is identity, not content, but it lands in the
+database and is worth knowing before sharing one.
+
 ## Architecture
 
 Four pieces, deliberately boring.
 
-**Collector.** An OTLP endpoint that accepts Claude Code's native export, plus
-a small hook shim (`PostToolUse`, `SubagentStart`/`Stop`) posting the detail
-traces omit. Both write to the same store.
+**Collector.** An OTLP endpoint that accepts Claude Code's native export, and
+-- independently -- a transcript reader that walks the on-disk session files.
+Both write to the same store, but neither imports the other: trace export is
+behind a beta flag, and the transcript path has to keep working if it moves.
 
 **Store.** SQLite for development, DuckDB when queries get analytical. Spans
 table, runs table, one materialised tree per run. No graph database — the
@@ -149,7 +265,7 @@ tempting mistake and the reason these projects end up as frontends.
 | Phase | | Success condition | Est. |
 | --- | --- | --- | --- |
 | 1 | **Ingest and store** | Point Claude Code at it, run a real task, see spans land in the database. | ~2 days |
-| 2 | **Reconstruct the tree** | A run with subagents renders as a correct nested tree. Hook shim + transcript parser, joined on `tool_use_id` and `parent_message_id`. | ~3 days |
+| 2 | **Reconstruct the tree** | A run with subagents renders as a correct nested tree. Transcript parser only -- no hook shim -- joined on `toolUseResult.agentId`, the workflow journal, and `uuid`/`parentUuid`. | ~3 days |
 | 3 | **Attribute cost** | Walk the tree assigning token deltas to nodes, cache reads and writes split. Reconcile the total against `ResultMessage.total_cost_usd` — that reconciliation is the correctness test. | ~2 days |
 | 4 | **Detectors** | Loop detection, run-vs-run divergence, unacknowledged tool failures. Pure functions, unit tested against recorded fixtures. The intellectual core. | ~4 days |
 | 5 | **The screen** | Run list, tree view, cost breakdown, findings, diff. Now it earns the name "command center" — because there is something behind it worth commanding. | ~4 days |
