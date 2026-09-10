@@ -14,8 +14,8 @@ actually cost you an afternoon:
 Contrail is the layer that answers those. The dashboard is the front end of a
 data model, not the product. Full reasoning in [`docs/spec.md`](docs/spec.md).
 
-**Status: Phase 3 of 5.** Ingest, store, subagent tree reconstruction and
-cost attribution work. The detectors do not exist yet.
+**Status: Phase 4 of 5.** Ingest, store, subagent tree reconstruction, cost
+attribution and the detectors all work. The screen is next.
 
 ---
 
@@ -135,6 +135,52 @@ table has not gone stale relative to theirs; if the two disagree, either
 table could be the wrong one. Reconciliation against actual billing is not
 something any local tool can do.
 
+## Finding what went wrong
+
+```bash
+contrail findings b2b42db2                 # all applicable detectors
+contrail findings b2b42db2 --evidence      # with the reasoning behind each
+contrail findings b2b42db2 --detector cost
+```
+
+```
+[redundant_repeats/unproductive_polling]
+  Read called 3x, each returning identical output while waiting on a background task
+  in: turn turn 188
+
+[cost_concentration]
+  subagent 'workflow-subagent' holds 95% of its parent's tokens (1,066,165 of 1,118,866)
+
+[unhandled_errors] (low confidence)
+  Read failed and nothing afterwards touched the same target
+```
+
+Four detectors, as pure functions over a run tree:
+
+| Detector | Rule | Confidence |
+| --- | --- | --- |
+| Redundant repeats | Same call, same **result** hash — so it is right about redundancy whatever caused it | high |
+| Cost concentration | A node holding a disproportionate share of its parent's tokens | high |
+| Outcome divergence | Agents given one task returning different structured outputs | high, where outputs are comparable |
+| Unhandled errors | A failed call after which nothing touched the same target | **low** — a structural proxy |
+
+Every finding carries its own evidence and its own confidence, because these
+rules are wrong often enough that a finding you cannot argue with is worse
+than no finding.
+
+**What is measured, and on how little.** The labelled sets are small and are
+quoted with their size everywhere they appear: 22 repeat groups (6 positive,
+15 negative, 1 undecidable), 14 hand-labelled unhandled-error findings
+(precision **3 of 14**), 25 verifier triples (3 split, 22 agreed). None of
+that is validation at scale.
+
+`unhandled_errors` reports a *shape*, never a verdict — it does not claim the
+agent ignored anything. Of its 14 labelled findings, 6 were tools the user
+declined at the permission prompt and 4 were reads probing for a file that
+does not exist, where moving on is exactly correct. The two thresholds on
+cost concentration are corpus-tuned defaults exposed as `--share-threshold`
+and `--min-tokens`, not rules.
+
 ## A negative result we kept
 
 One of the three originally planned detectors diffed two runs of the same
@@ -184,9 +230,10 @@ contrail/
   transcript.py  JSONL session parser and subagent tree reconstruction
   cost.py        dated price lookup, cost attribution, reconciliation
   prices.json    the price table -- data with effective dates, not code
+  detectors.py   repeats, cost concentration, divergence, unhandled errors
   cli.py         serve / runs / show / demo / parse / sessions / tree /
-                 cost / reconcile
-tests/           161 tests, no network, nothing written outside tmp_path
+                 cost / reconcile / findings
+tests/           213 tests, no network, nothing written outside tmp_path
 docs/spec.md     Why this exists and what the remaining phases are
 ```
 
@@ -208,8 +255,8 @@ one line, not migrating a database.
 | 1 | Ingest and store | done |
 | 2 | Subagent tree reconstruction | done |
 | 3 | Cost attribution per node | done |
-| 4 | Loop, divergence and silent-failure detectors | next |
-| 5 | The screen | |
+| 4 | Detectors | done |
+| 5 | The screen | next |
 
 ## Development
 

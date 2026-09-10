@@ -75,6 +75,27 @@ WORKFLOW_TOOLS = frozenset({"Workflow"})
 
 CAPTURE_CONTENT_ENV = "CONTRAIL_CAPTURE_CONTENT"
 
+# Arguments naming the thing a call acts on. Stored only as a hash, so
+# "same target" comparisons work without keeping the path itself.
+TARGET_KEYS = ("file_path", "notebook_path", "path")
+
+# Keys on `toolUseResult` that vary per invocation without the *result*
+# varying. Left in, two identical calls hash differently and a repeat stops
+# being detected -- silently. tests/test_detectors.py hashes a known-identical
+# pair and fails if they diverge, which is the guard against this list rotting.
+VOLATILE_RESULT_KEYS = frozenset({
+    "backgroundTaskId",
+    "backgroundCwdHint",
+    "timedOutAfterMs",
+    "persistedOutputPath",
+    "persistedOutputSize",
+})
+
+# A background task's output file. The id in the path is the same id the
+# launching call reports as `backgroundTaskId`, which is what lets a re-read
+# of a still-running task be told apart from a genuinely redundant one.
+_TASK_OUTPUT = re.compile(r"/tasks/([A-Za-z0-9_-]+)\.output$")
+
 _WHITESPACE = re.compile(r"\s+")
 
 # A comma-separated run of bare tokens, with an optional `name:` prefix --
@@ -158,6 +179,69 @@ def normalise_argument(value: Any) -> Any:
     return normalise_argument(str(value))
 
 
+def _short_hash(blob: str) -> str:
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
+
+
+def target_of(tool_input: Any) -> str | None:
+    """The normalised path a call acts on, if its arguments name one."""
+    if not isinstance(tool_input, dict):
+        return None
+    for key in TARGET_KEYS:
+        value = tool_input.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.replace("\\", "/").strip().lower()
+    return None
+
+
+def target_hash(tool_input: Any) -> str | None:
+    """Non-reversible identity for a call's target. Never the path itself."""
+    target = target_of(tool_input)
+    return _short_hash(target) if target else None
+
+
+def background_task_id(tool_input: Any, tool_use_result: Any) -> str | None:
+    """The background task this call launched, or whose output it reads.
+
+    Both sides are recorded so a poll can be recognised: the launching call
+    reports the id in its result, and a read of that task's output carries the
+    same id in its path.
+    """
+    if isinstance(tool_use_result, dict):
+        value = tool_use_result.get("backgroundTaskId")
+        if isinstance(value, str) and value:
+            return value
+    target = target_of(tool_input)
+    if target:
+        match = _TASK_OUTPUT.search(target)
+        if match:
+            return match.group(1)
+    return None
+
+
+def result_hash(tool_use_result: Any) -> str | None:
+    """Non-reversible identity for a tool result. Never the result itself.
+
+    `toolUseResult` is a dict on success and a plain string on error, and both
+    must hash -- an earlier version only handled dicts and reported every
+    failed call as having no result at all.
+
+    Per-invocation keys are excluded, so two calls that did the same thing
+    and got the same answer hash the same even when the harness stamped a
+    fresh task id on each.
+    """
+    if tool_use_result is None:
+        return None
+    payload = tool_use_result
+    if isinstance(payload, dict):
+        payload = {
+            k: v for k, v in payload.items() if k not in VOLATILE_RESULT_KEYS
+        }
+    return _short_hash(
+        json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+    )
+
+
 def tool_signature(tool_name: str | None, tool_input: Any) -> str:
     """A stable, non-reversible signature for one tool call.
 
@@ -229,10 +313,14 @@ class TranscriptRecord:
     tool_use_id: str | None = None
     tool_name: str | None = None
     tool_signature: str | None = None
+    # Hashes, never the values. See `target_hash` / `result_hash`.
+    target_hash: str | None = None
+    background_task_id: str | None = None
 
     # --- tool result (user) --------------------------------------------
     is_tool_result: bool = False
     is_error: bool = False
+    result_hash: str | None = None
     result_status: str | None = None
     result_agent_id: str | None = None
     result_agent_type: str | None = None
@@ -357,9 +445,12 @@ def parse_record(raw: dict[str, Any]) -> TranscriptRecord | None:
         elif btype == "tool_use" and rec.tool_use_id is None:
             rec.tool_use_id = block.get("id")
             rec.tool_name = block.get("name")
-            rec.tool_signature = tool_signature(block.get("name"), block.get("input"))
+            tool_input = block.get("input")
+            rec.tool_signature = tool_signature(block.get("name"), tool_input)
+            rec.target_hash = target_hash(tool_input)
+            rec.background_task_id = background_task_id(tool_input, None)
             if keep_content:
-                rec.content = json.dumps(block.get("input"), default=str)
+                rec.content = json.dumps(tool_input, default=str)
         elif btype == "tool_result" and not rec.is_tool_result:
             rec.is_tool_result = True
             rec.tool_use_id = block.get("tool_use_id")
@@ -379,6 +470,9 @@ def parse_record(raw: dict[str, Any]) -> TranscriptRecord | None:
     rec.text_len = text_len
 
     tur = raw.get("toolUseResult")
+    if tur is not None:
+        rec.result_hash = result_hash(tur)
+        rec.background_task_id = rec.background_task_id or background_task_id(None, tur)
     if isinstance(tur, dict):
         rec.result_status = tur.get("status")
         rec.result_agent_id = tur.get("agentId")

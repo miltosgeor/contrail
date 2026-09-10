@@ -97,6 +97,9 @@ CREATE TABLE IF NOT EXISTS transcript_records (
     tool_use_id           TEXT,
     tool_name             TEXT,
     tool_signature        TEXT,
+    target_hash           TEXT,
+    background_task_id    TEXT,
+    result_hash           TEXT,
     is_tool_result        INTEGER NOT NULL DEFAULT 0,
     is_error              INTEGER NOT NULL DEFAULT 0,
     result_status         TEXT,
@@ -173,6 +176,7 @@ CREATE INDEX IF NOT EXISTS idx_tr_session   ON transcript_records(session_id);
 CREATE INDEX IF NOT EXISTS idx_tr_agent     ON transcript_records(agent_id);
 CREATE INDEX IF NOT EXISTS idx_tr_tooluse   ON transcript_records(tool_use_id);
 CREATE INDEX IF NOT EXISTS idx_tr_signature ON transcript_records(tool_signature);
+CREATE INDEX IF NOT EXISTS idx_tr_target    ON transcript_records(target_hash);
 CREATE INDEX IF NOT EXISTS idx_tr_ts        ON transcript_records(ts_ns);
 CREATE INDEX IF NOT EXISTS idx_tn_session ON tree_nodes(session_id);
 CREATE INDEX IF NOT EXISTS idx_tn_parent  ON tree_nodes(parent_node_id);
@@ -182,7 +186,8 @@ CREATE INDEX IF NOT EXISTS idx_tn_kind    ON tree_nodes(kind);
 RECORD_COLUMNS = (
     "uuid", "session_id", "agent_id", "parent_uuid", "type", "timestamp",
     "ts_ns", "is_sidechain", "model", "request_id", "tool_use_id", "tool_name",
-    "tool_signature", "is_tool_result", "is_error", "result_status",
+    "tool_signature", "target_hash", "background_task_id", "result_hash",
+    "is_tool_result", "is_error", "result_status",
     "result_agent_id", "result_run_id", "input_tokens", "output_tokens",
     "cache_read_tokens", "cache_creation_tokens", "cache_write_5m_tokens",
     "cache_write_1h_tokens", "thinking_tokens", "service_tier", "node_id",
@@ -229,6 +234,9 @@ class Store:
         ("transcript_records", "thinking_tokens", "INTEGER NOT NULL DEFAULT 0"),
         ("transcript_records", "service_tier", "TEXT"),
         ("transcript_records", "node_id", "TEXT"),
+        ("transcript_records", "target_hash", "TEXT"),
+        ("transcript_records", "background_task_id", "TEXT"),
+        ("transcript_records", "result_hash", "TEXT"),
         ("tree_nodes", "cache_write_5m_tokens", "INTEGER NOT NULL DEFAULT 0"),
         ("tree_nodes", "cache_write_1h_tokens", "INTEGER NOT NULL DEFAULT 0"),
         ("tree_nodes", "thinking_tokens", "INTEGER NOT NULL DEFAULT 0"),

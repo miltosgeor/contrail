@@ -16,19 +16,23 @@ change.
 
 ## Current state
 
-Phases 1-3 complete. 161 tests pass. Phase 3 was verified against real data:
-the attribution invariant holds exactly (94,086,758 tokens attributed ==
-94,086,758 in the source), transcript and span tokens agree on 154 of 154
-matched calls, and our computed cost matched Claude Code's own cost counter to
-six decimal places on a captured run.
+Phases 1-4 complete. 213 tests pass. The detectors run against real traces,
+which was the condition for starting Phase 5.
 
 | Phase | | Status |
 | --- | --- | --- |
 | 1 | Ingest and store | done |
 | 2 | Subagent tree reconstruction | done |
 | 3 | Cost attribution per node | done |
-| 4 | Loop / divergence / silent-failure detectors | next |
-| 5 | The screen | |
+| 4 | Detectors | done |
+| 5 | The screen | next |
+
+**Phase 4's labelled sets are small and every claim about them is quoted with
+its size.** Redundant repeats: 22 groups, 6 positive, 15 negative, 1
+undecidable. Unhandled errors: 14 findings hand-labelled, precision 3/14.
+Outcome divergence: 25 real verifier triples, 3 split, 22 agreed. Path-diff
+divergence was dropped on evidence -- see the negative result in
+`docs/spec.md`.
 
 **Phase order is a constraint, not a suggestion.** Phases 2–4 are the reason
 this project exists. Starting Phase 5 early is the documented failure mode —
@@ -46,8 +50,10 @@ contrail/
   transcript.py  JSONL session parser and subagent tree reconstruction
   cost.py        dated price lookup, cost attribution, reconciliation
   prices.json    the price table -- data with effective dates, not code
+  detectors.py   redundant repeats, cost concentration, outcome divergence,
+                 unhandled errors -- pure functions over a run tree
   cli.py         serve / runs / show / demo / parse / sessions / tree /
-                 cost / reconcile
+                 cost / reconcile / findings
 tests/           mirrors the module names, one file each
 docs/spec.md     why this exists, the three gaps, the phase plan
 ```
@@ -164,6 +170,48 @@ agreement is independent evidence. Agreement with `claude_code.cost.usage`
 checks our price table against the one bundled in the CLI -- that counter is
 a client-side estimate, not a billing figure, and must never be called ground
 truth.
+
+## Conventions established by Phase 4 -- keep these
+
+**A repeat is redundant when the *result* did not change, not when no write
+appears in between.** The first rule tried here asked "was there an
+intervening write to the same target?" and was wrong on 8 of the 9 cases it
+flagged: files are also rewritten by background processes and by shell
+commands that leave no write in the trace. Comparing result hashes is right
+about redundancy whatever caused it. Repeated writes take a separate branch
+keyed on `is_error`, because an identical edit applied twice should fail the
+second time -- all ten repeated writes in the corpus were retries.
+
+**Never store content to compare it; store a hash.** `result_hash`,
+`target_hash` and `tool_signature` are all 16 hex chars and non-reversible.
+`background_task_id` is a harness id, not content.
+
+**`VOLATILE_RESULT_KEYS` rotting is a silent regression.** A new
+per-invocation key appears, two identical calls stop hashing the same,
+repeats quietly stop being detected and nothing says so. There is a test that
+hashes a known-identical pair from fixtures and fails if they diverge. Keep
+it, and add new keys to the list when it fires.
+
+**Findings carry their own evidence and their own confidence.** These rules
+are wrong often enough that a finding nobody can argue with is worse than no
+finding. `detect_unhandled_errors` is `confidence=low` with its measured
+precision embedded, and it reports a shape -- "this failed and nothing
+afterwards touched the same target" -- never a verdict. Some errors are
+informative and moving on is correct behaviour.
+
+**Detector thresholds are named parameters with corpus-tuned defaults, and
+say so.** `DEFAULT_SHARE_THRESHOLD` and `DEFAULT_MIN_TOKENS` come from
+looking at one corpus, not from a principle, and every finding repeats that
+in its evidence. A tuned constant presented as a rule is what the divergence
+negative result taught us to avoid.
+
+**Genuine redundancy and unproductive polling are separate subtypes.**
+Different phenomena, different remedies; lumping them makes the detector look
+noisier than it is. `backgroundTaskId` is the discriminator.
+
+**Quote the sample size wherever precision is reported.** 22 repeat groups
+and 14 labelled error findings are not validation at scale, and must never be
+presented as if they were.
 
 ## Working notes for Phase 2 -- done, kept for context
 

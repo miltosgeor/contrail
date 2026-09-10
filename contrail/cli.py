@@ -10,6 +10,7 @@
     contrail tree <session_id>     print one reconstructed run tree
     contrail cost <session_id>     attribute cost across the run tree
     contrail reconcile <session>   check the attribution three ways
+    contrail findings <session>    run the detectors
 
 The two groups are separate paths on purpose: `parse`/`sessions`/`tree` read
 the JSONL Claude Code already writes and need no collector and no telemetry
@@ -443,6 +444,90 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
     return 1 if not results[0].ok else 0
 
 
+
+def cmd_findings(args: argparse.Namespace) -> int:
+    """Run the detectors over one parsed session.
+
+    Three of the four detectors work off stored data. Outcome divergence is
+    not among them: it needs groups of agents known to share a task, and
+    identifying those requires normalising a prompt template -- the corpus's
+    verifier triples differ only by a voter index -- which is workflow-specific
+    and cannot be constructed generically from the store. It is available as
+    `detectors.detect_outcome_divergence` for a caller that can supply the
+    grouping, and docs/spec.md states that precondition.
+    """
+    from .cost import PriceTable, attribute_cost
+    from .detectors import (
+        COST_CONCENTRATION,
+        detect_cost_concentration,
+        detect_redundant_repeats,
+        detect_unhandled_errors,
+    )
+
+    store = Store(args.db)
+    row = _resolve_session(store, args.session)
+    if row is None:
+        print(f"no parsed session matching {args.session!r}", file=sys.stderr)
+        print("try: contrail parse", file=sys.stderr)
+        return 1
+
+    session_id = row["session_id"]
+    records = store.transcript_records_for(session_id)
+    scope = store.record_scope_for(session_id)
+    nodes = store.tree_nodes(session_id)
+    if not records:
+        print("session has no stored records -- try: contrail parse",
+              file=sys.stderr)
+        return 1
+
+    findings = []
+    wanted = args.detector
+    if wanted in (None, "repeats"):
+        findings += detect_redundant_repeats(records, scope, session_id)
+    if wanted in (None, "cost"):
+        priced_at = _priced_at(args, row)
+        run = attribute_cost(nodes, records, scope, PriceTable(),
+                             priced_at, session_id)
+        findings += detect_cost_concentration(
+            run, share_threshold=args.share_threshold,
+            min_tokens=args.min_tokens, session_id=session_id,
+        )
+    if wanted in (None, "errors"):
+        findings += detect_unhandled_errors(records, scope, session_id)
+
+    print(f"session {session_id}  [{row['project_slug']}]")
+    print(f"  {len(findings)} finding(s) from {len(records):,} records\n")
+    if not findings:
+        print("  nothing flagged")
+        return 0
+
+    labels = {n["node_id"]: f"{n['kind']} {n['label']}" for n in nodes}
+    for finding in findings:
+        mark = "" if finding.confidence == "high" else f" ({finding.confidence} confidence)"
+        subtype = f"/{finding.subtype}" if finding.subtype else ""
+        print(f"[{finding.detector}{subtype}]{mark}")
+        print(f"  {finding.summary}")
+        if finding.node_id:
+            print(f"  in: {labels.get(finding.node_id, finding.node_id)[:70]}")
+        if args.evidence:
+            for key, value in finding.evidence.items():
+                text = str(value)
+                if len(text) > 96:
+                    text = text[:93] + "..."
+                print(f"    {key}: {text}")
+        print()
+
+    by_detector: dict[str, int] = {}
+    for finding in findings:
+        key = finding.detector + (f"/{finding.subtype}" if finding.subtype else "")
+        by_detector[key] = by_detector.get(key, 0) + 1
+    print("summary: " + ", ".join(f"{k} x{v}" for k, v in sorted(by_detector.items())))
+    if any(f.detector == COST_CONCENTRATION for f in findings):
+        print("note: cost-concentration thresholds are corpus-tuned defaults; "
+              "see --share-threshold / --min-tokens")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="contrail", description=__doc__)
     parser.add_argument("--db", default=os.environ.get("CONTRAIL_DB", "contrail.db"))
@@ -494,6 +579,24 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--counter", help="JSON {model: usd} from claude_code.cost.usage")
     p.add_argument("--tolerance", type=float, default=0.02)
     p.set_defaults(func=cmd_reconcile)
+
+    from .detectors import DEFAULT_MIN_TOKENS, DEFAULT_SHARE_THRESHOLD
+
+    p = sub.add_parser("findings", help="run the detectors over one session")
+    p.add_argument("session", help="full or partial session id")
+    p.add_argument("--detector", choices=("repeats", "cost", "errors"),
+                   help="run only one detector (default: all applicable)")
+    p.add_argument("--at", help="price at this ISO date instead of the run's own")
+    p.add_argument("--share-threshold", type=float,
+                   default=DEFAULT_SHARE_THRESHOLD,
+                   help="cost concentration: a child's share of its parent "
+                        "(corpus-tuned default, not a rule)")
+    p.add_argument("--min-tokens", type=int, default=DEFAULT_MIN_TOKENS,
+                   help="cost concentration: absolute floor below which "
+                        "concentration is not reported")
+    p.add_argument("--evidence", action="store_true",
+                   help="print the evidence behind each finding")
+    p.set_defaults(func=cmd_findings)
 
     args = parser.parse_args(argv)
     return args.func(args)
