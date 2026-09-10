@@ -1,0 +1,8 @@
+# Normalise line endings in the repository to LF regardless of platform.
+# The author works on Windows with core.autocrlf=true, so without this a
+# checkout can silently rewrite every line of every file and bury a real
+# diff under thousands of line-ending changes.
+* text=auto eol=lf
+
+# Recorded transcript fixtures are read byte-for-byte; never rewrite them.
+*.jsonl -text
