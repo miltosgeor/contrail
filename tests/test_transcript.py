@@ -879,3 +879,50 @@ def test_a_turn_does_not_absorb_its_subagents_tokens(tmp_path):
     )
     assert node_by(tree, KIND_TURN).input_tokens == 5
     assert node_by(tree, KIND_SUBAGENT).input_tokens == 100
+
+
+# --- Regression: a set written inline as a comma-separated string --------
+#
+# Two verifier agents given an identical task produced different tool
+# signatures whose only difference was the order of a comma-separated list.
+# That is the same call, and a loop detector must see it as one.
+
+def test_signature_ignores_the_order_of_an_inline_token_set():
+    assert tool_signature("ToolSearch", {"query": "select:WebSearch,WebFetch"}) == (
+        tool_signature("ToolSearch", {"query": "select:WebFetch,WebSearch"})
+    )
+
+
+def test_the_prefix_of_an_inline_token_set_is_preserved():
+    assert normalise_argument("select:b,a") == "select:a,b"
+
+
+def test_a_bare_token_list_is_sorted():
+    assert normalise_argument("c,a,b") == "a,b,c"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "pytest -q, --verbose",      # spaces: a shell command, not a set
+        "a/b.py,c/d.py",             # paths: order may matter
+        "x=1,y=2",                   # assignments
+        "Hello, world, how are you",  # prose
+        "a, b",                      # spaced list, left alone deliberately
+    ],
+)
+def test_comma_sorting_leaves_everything_else_alone(text):
+    """Over-normalising merges genuinely different calls, which is worse
+    than missing a repeat."""
+    assert normalise_argument(text) == text
+
+
+def test_sorting_a_token_list_can_merge_an_ordered_list():
+    """The documented trade-off, asserted so it stays a known choice.
+
+    An order-significant bare list collapses to one signature. Acceptable for
+    loop detection -- two calls differing only in list order are doing
+    near-identical work -- but it is the one normaliser here that can merge
+    distinct calls.
+    """
+    assert normalise_argument("id,name") == normalise_argument("name,id")

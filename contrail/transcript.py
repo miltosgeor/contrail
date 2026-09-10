@@ -77,6 +77,15 @@ CAPTURE_CONTENT_ENV = "CONTRAIL_CAPTURE_CONTENT"
 
 _WHITESPACE = re.compile(r"\s+")
 
+# A comma-separated run of bare tokens, with an optional `name:` prefix --
+# the shape of a set passed as a string, e.g. ToolSearch's
+# `select:WebFetch,WebSearch`. A token deliberately excludes space, `/`, `\`,
+# `=` and `:`, so paths, assignments and prose never match.
+_TOKEN_LIST = re.compile(
+    r"^(?P<prefix>[A-Za-z_][A-Za-z0-9_.\-]*:)?"
+    r"(?P<items>[A-Za-z0-9_.+\-]+(?:,[A-Za-z0-9_.+\-]+)+)$"
+)
+
 
 def capture_content_enabled() -> bool:
     """Content capture is opt-in and off by default. See CLAUDE.md."""
@@ -92,6 +101,15 @@ def default_projects_root() -> Path:
 
 # ---------------------------------------------------------------- signatures
 
+def _sort_token_list(text: str) -> str:
+    """Sort a comma-separated run of bare tokens, preserving any prefix."""
+    match = _TOKEN_LIST.match(text)
+    if match is None:
+        return text
+    items = sorted(match.group("items").split(","))
+    return (match.group("prefix") or "") + ",".join(items)
+
+
 def normalise_argument(value: Any) -> Any:
     """Canonicalise one tool argument for signature hashing.
 
@@ -106,12 +124,28 @@ def normalise_argument(value: Any) -> Any:
     Case is preserved -- it is significant in code, identifiers and paths on
     the platforms we care about.
 
+    It also sorts a comma-separated run of bare tokens, because such a string
+    is a *set* written inline and its order carries no meaning:
+    `select:WebSearch,WebFetch` and `select:WebFetch,WebSearch` are the same
+    call. Measured need for this -- two verifier agents given an identical
+    task produced different signatures whose only difference was that
+    ordering. The token pattern excludes anything containing a space, a
+    forward or back slash, `=` or `:`, so paths, shell commands, assignments
+    and prose are left alone.
+
+    The trade-off is stated rather than hidden: an order-significant bare
+    list (a CSV column order, say) collapses to one signature. For loop
+    detection that is acceptable -- two calls differing only in list order
+    are doing near-identical work -- but it is the one place here that can
+    merge genuinely distinct calls, so extend it carefully.
+
     This function is the seam Phase 4 extends. docs/spec.md flags argument
     normalisation as the hard part of loop detection, and expects the first
     version to be wrong; adding a normaliser here should stay one place.
     """
     if isinstance(value, str):
-        return _WHITESPACE.sub(" ", value.replace("\\", "/")).strip()
+        text = _WHITESPACE.sub(" ", value.replace("\\", "/")).strip()
+        return _sort_token_list(text)
     if isinstance(value, dict):
         # Sorted so key order in the JSONL cannot change the signature.
         return {k: normalise_argument(value[k]) for k in sorted(value, key=str)}
