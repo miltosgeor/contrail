@@ -518,9 +518,161 @@ tempting mistake and the reason these projects end up as frontends.
 | 3 | **Attribute cost** | Walk the tree assigning tokens to nodes, cache reads and both write TTLs split. Reconcile in three layers (see *Cost attribution, as verified*); the arithmetic invariant is the correctness test. | ~2 days |
 | 4 | **Detectors** | Redundant repeats, cost concentration, outcome divergence, unhandled errors. Pure functions, tested against a hand-labelled corpus sample. Path-diff divergence dropped on evidence -- see the negative result under Gap 3. | ~4 days |
 | 5 | **The screen** | Session list, findings, cost breakdown, tree — opening on findings and cost, with the tree reachable only from a finding. One static file, no build step. Diff dropped: see the Gap 3 negative result. | ~4 days |
+| 6 | **Recommend, then enforce** | *Not started.* A recommendation, applied in paired A/B runs, moves its target metric by more than run-to-run variance across many runs; only then an enforcing form. See the roadmap below. | — |
 
-Timings assume part-time work alongside other commitments; treat them as
-ordering, not deadlines.
+Phases 1–5 shipped as v0.1.0. Timings assume part-time work alongside other
+commitments; treat them as ordering, not deadlines.
+
+## Roadmap: Phase 6 — observe, recommend, enforce
+
+**Status: not started.** v0.1.0 observes. Everything below is a plan, and it
+is written with its preconditions attached, because those are what separate
+a roadmap from a wish list.
+
+### The arc
+
+1. **Observe** — shipped in v0.1.0. Reconstruct the run, attribute cost,
+   report findings with their evidence.
+2. **Recommend** — turn a finding into a concrete, reviewable change: a hook
+   configuration, an agent definition, a setting.
+3. **Enforce** — install that change so the pattern is prevented rather than
+   reported after the fact.
+
+### The mechanism: hooks are an actuator, not only a sensor
+
+Hooks were dropped from Phase 2 because the transcripts made them unnecessary
+as a *sensor*. They matter again here as an *actuator*. What each can do,
+checked against the hooks and subagents references in September 2026 — this
+spec has been wrong three times from describing capabilities from memory, so
+re-check before building on any of it:
+
+| Hook / setting | Can | Cannot |
+| --- | --- | --- |
+| `PreToolUse` | deny a call (`permissionDecision: "deny"` with a reason), rewrite its arguments (`updatedInput`), add context the model sees (`additionalContext`) | — |
+| `PostToolUse` | add context the model sees (`additionalContext`), surface a message (`systemMessage`) | block — the tool already ran; rewrite or filter the result — no documented field |
+| `UserPromptSubmit` | add context (`additionalContext`), block the prompt (exit code 2) | — |
+| `SessionStart` | add context | — |
+| Subagent model | set per agent in definition frontmatter (`model:`), per invocation (the `model` parameter), or by default (`CLAUDE_CODE_SUBAGENT_MODEL`, with `CLAUDE_CODE_SUBAGENT_MODEL_FORCE` to override the others) | be changed by any hook |
+
+Two consequences for the design. `PostToolUse` cannot filter a result, so
+anything that must act on output does it by adding context to the next turn,
+not by editing what the tool returned. And model routing is emitted as agent
+definitions and settings rather than hooks — still configuration Contrail can
+generate, just not hook configuration.
+
+### From finding to change
+
+| Finding | Recommend | Enforce via |
+| --- | --- | --- |
+| Redundant repeat | "you read this file earlier and it has not changed" | `PreToolUse` — `additionalContext`, or `deny` with that reason |
+| Unproductive polling | back off instead of re-reading unchanged output | `PreToolUse` — `additionalContext` |
+| Unhandled error | make the failure impossible to scroll past | `PostToolUse` — `additionalContext` naming the failure, so the next turn sees it |
+| Cost concentration | run that work on a cheaper model | agent definition `model:` or `CLAUDE_CODE_SUBAGENT_MODEL` |
+
+**The redundant-repeat row has a hard problem, and it is the best argument
+for recommend-before-enforce.** The detector is correct because it compares
+the *result* of two calls. A `PreToolUse` hook runs before the call, when the
+result does not exist yet. An enforcing hook therefore cannot use the rule
+that makes the detector right, and falls back towards the rule it replaced —
+"is this the same call?" — which was wrong on 8 of the 9 cases it flagged,
+because files change without a write appearing in the trace. The workable
+version for `Read` is narrower: the hook checks the file itself at call time
+and only intervenes if its content is unchanged since the last read. For
+shell commands and background tasks there is no equivalent check.
+
+### What the data says the levers are
+
+Measured over the same six sessions, priced at 2026-09-10 rates — a
+counterfactual for the sessions that predate the price table.
+
+**Loops are rare.** At labelling time the corpus held 5,461 tool calls. Only
+22 groups repeated a call within one node, and under the result-hash rule
+**2 were genuinely redundant** and 4 were unproductive polling of a background
+task — 6 groups in 5,461 calls. The single case an earlier rule called a clear
+loop is undecidable, because its results are not on disk. Loop prevention is
+real but small here.
+
+**The money is in context, and in the main conversation's model.**
+
+| Where spend goes | Share |
+| --- | --- |
+| Cache reads | 45.2% |
+| 1-hour-TTL cache writes | 41.3% |
+| Output | 11.5% |
+| 5-minute-TTL cache writes | 1.8% |
+| Uncached input | 0.1% |
+
+86.5% of spend is re-reading and re-writing context, not producing output.
+And 85.1% of spend is Opus in the *main* conversation: pricing those same
+tokens at Sonnet rates would cut total spend by 34%. That figure is an upper
+bound — it assumes a cheaper model uses the same tokens and does acceptable
+work, and Contrail cannot judge the second part.
+
+**Subagent routing is small on this corpus.** Subagents account for 2.4% of
+spend. Moving every Opus-priced subagent call to Haiku would save at most $42
+of $3,506, about 1.2%. That contradicts the obvious reading of cost
+concentration — "route the expensive subagent to a cheaper model" — for these
+sessions, which is exactly why it is measured rather than assumed.
+
+So the larger lever is likely cost rather than loop prevention, and within
+cost it is main-conversation model choice and context growth rather than
+subagent routing. That the 1-hour TTL accounts for 41% of spend at 2x input
+rates, against 1.8% for the 1.25x 5-minute TTL, is a question worth asking —
+whether a given session's turn cadence justifies it — not yet a
+recommendation, because whether that choice is controllable was not checked.
+
+These shares are dominated by one session, which alone is 77% of spend. That
+is the first precondition, made concrete.
+
+### Preconditions — what stops this being vapourware
+
+**1. Volume.** Six sessions is noise. One session is 77% of the spend, so any
+corpus-level share is mostly a description of that one session. A pattern is
+not a finding until it recurs across many runs and several projects, and a
+recommendation needs a base rate to compare against. The detectors can run on
+six sessions; recommendations cannot be justified by them.
+
+**2. Attribution needs A/B.** To say a change helped, run the same task with
+and without it. Before-and-after on different tasks cannot separate the
+change from the task. And the same task varies a lot on its own: among the 22
+verifier triples that *agreed* on outcome, mean pairwise path distance was
+0.839 — three runs of one task barely resembled each other. A single
+comparison sits inside that variance. It takes enough paired runs to clear it.
+
+**3. Recommend before enforce.** A hook that blocks a "redundant" read will
+eventually block a legitimate one, and the redundant-repeat case above shows
+the enforce-time rule is weaker than the detector's by construction. Every
+change ships first as a recommendation, is validated by A/B, and only then is
+offered in enforcing form. `unhandled_errors` — measured at 3 of 4 on a sample
+of four — is not a candidate for enforcement on that evidence at all.
+
+**4. Emitted, never installed.** Contrail generates configuration for a
+person to read and install. It does not write to `.claude/settings.json`,
+does not modify a running session, and does not install hooks itself. That
+keeps the tool read-only over runs that already happened, as the scope says,
+and keeps a human between a heuristic and an agent's permissions.
+
+### Boundaries
+
+**Process, not output quality.** Contrail can see that an agent re-read a file,
+ignored a failure, or spent most of a session's budget on context. It
+cannot see that the code it wrote was wrong. Evals stay out of scope. This
+bites hardest on model routing: Contrail can say what a cheaper model *would
+have cost* and never whether it *would have done the job* — so routing stays
+recommend-only unless paired with the user's own evals.
+
+**Say what the data does not support.** Loops were rare in this corpus. A
+roadmap that led with loop prevention would promise the feature the
+measurements back least.
+
+### Success condition
+
+A recommendation, applied in paired A/B runs on the same task, moves the
+metric it targets by more than the run-to-run variance of that task — across
+enough runs and projects that the result is not one session's. No enforcing
+form of any recommendation ships before its recommend form has cleared that
+bar.
+
 
 ## Not in scope
 
@@ -531,7 +683,7 @@ each one saves a week.
 - **Not framework-agnostic yet.** Claude-first. OTel underneath means LangGraph support is later work, not a rewrite.
 - **Not evals.** Contrail says what happened and what it cost. It does not score output quality.
 - **Not a prompt playground.** No editing, no replay-with-changes. Read-only over runs that already happened.
-- **Not real-time streaming at first.** Runs appear when they finish. Live tailing is a Phase 6 nice-to-have.
+- **Not real-time streaming at first.** Runs appear when they finish. Live tailing is a later nice-to-have, separate from the Phase 6 roadmap.
 
 ## Corrections
 

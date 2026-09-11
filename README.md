@@ -290,6 +290,7 @@ one line, not migrating a database.
 | 3 | Cost attribution per node | done |
 | 4 | Detectors | done |
 | 5 | The screen | done |
+| 6 | Recommend, then enforce | [roadmap](docs/spec.md#roadmap-phase-6--observe-recommend-enforce) |
 
 ## Development
 
