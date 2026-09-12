@@ -604,7 +604,13 @@ real but small here.
 
 86.5% of spend is re-reading and re-writing context, not producing output.
 And 85.1% of spend is Opus in the *main* conversation: pricing those same
-tokens at Sonnet rates would cut total spend by 34%. That figure is an upper
+tokens at Sonnet rates would cut total spend by 34%.
+
+**These figures are a snapshot, not a fixed truth.** They were measured while
+the corpus was still being added to, so a later run of `contrail spend`
+reports different numbers -- 88% context and $3,554 within two days of the
+above, because the session writing this document kept going. Treat the shares
+as the shape of the bill, not as constants; `contrail spend` recomputes them. That figure is an upper
 bound — it assumes a cheaper model uses the same tokens and does acceptable
 work, and Contrail cannot judge the second part.
 
@@ -616,10 +622,32 @@ sessions, which is exactly why it is measured rather than assumed.
 
 So the larger lever is likely cost rather than loop prevention, and within
 cost it is main-conversation model choice and context growth rather than
-subagent routing. That the 1-hour TTL accounts for 41% of spend at 2x input
-rates, against 1.8% for the 1.25x 5-minute TTL, is a question worth asking —
-whether a given session's turn cadence justifies it — not yet a
-recommendation, because whether that choice is controllable was not checked.
+subagent routing.
+
+The 1-hour TTL accounts for 41% of spend at 2x base input, against 1.8% for
+the 1.25x 5-minute TTL, and that question has since been **checked rather
+than left open**. Three findings, all verified:
+
+- **The TTL is controllable.** `promptCacheTtl` (or
+  `CLAUDE_CODE_PROMPT_CACHE_TTL`) sets it for the main conversation and
+  `subagentPromptCacheTtl` for everything else; both take `5m` or `1h` and
+  need Claude Code v2.1.242 or later. `FORCE_PROMPT_CACHING_5M=1` forces the
+  short TTL for both. So the lever can be named, which is what a
+  recommendation requires.
+- **This corpus did not choose it.** Claude Code requests the one-hour TTL by
+  default for the main conversation on a Claude subscription within plan
+  usage, while everything else stays on five minutes. The corpus matches that
+  split exactly -- 98.7% of main-conversation cache-write tokens are 1h,
+  against 0% for subagents -- so the 41% is a default, not a decision.
+- **Which makes the saving notional here.** Within plan usage there is no
+  per-token bill to reduce, and Claude Code already drops to the five-minute
+  TTL once a subscription starts drawing on usage credits. The comparison
+  matters to someone billed per token by API key or credits, where the
+  five-minute TTL is already the default.
+
+That sequence is the point: the measurement pointed at a lever, checking the
+lever changed what the measurement meant, and the recommendation that survived
+is narrower than the one the number suggested.
 
 These shares are dominated by one session, which alone is 77% of spend. That
 is the first precondition, made concrete.

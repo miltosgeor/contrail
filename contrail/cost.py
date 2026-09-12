@@ -233,19 +233,43 @@ class Tokens:
         )
 
 
-def price_tokens(tokens: Tokens, price: Price) -> float:
-    """USD for one bundle of tokens at one price row.
+# The five priced token classes, in the order they are reported. Cache reads
+# and the two write TTLs are separate classes because they price differently
+# -- 0.1x, 1.25x and 2x base input respectively.
+TOKEN_CLASSES: tuple[str, ...] = (
+    "input", "output", "cache_read", "cache_write_5m", "cache_write_1h",
+)
 
-    Each category is charged at its own rate; categories are never summed
-    together first. `thinking` is not charged -- it is already inside output.
+
+def price_breakdown(tokens: Tokens, price: Price) -> dict[str, float]:
+    """USD per token class for one bundle of tokens at one price row.
+
+    **This is the only place in the codebase where a rate is applied to a
+    token count.** `price_tokens` is its sum, and everything else -- cost
+    attribution, the spend report, the cache economics -- goes through one of
+    those two. A second pricing path is how the two silently diverge, so
+    there is a test asserting this sums to `price_tokens` for every row in
+    the real table.
+
+    Each class is charged at its own rate; classes are never summed together
+    first. `thinking` is not charged -- it is already inside output.
     """
-    return (
-        tokens.input * price.input_usd_per_mtok
-        + tokens.output * price.output_usd_per_mtok
-        + tokens.cache_read * price.cache_read_usd_per_mtok
-        + tokens.cache_write_5m * price.cache_write_5m_usd_per_mtok
-        + tokens.cache_write_1h * price.cache_write_1h_usd_per_mtok
-    ) / MTOK
+    return {
+        "input": tokens.input * price.input_usd_per_mtok / MTOK,
+        "output": tokens.output * price.output_usd_per_mtok / MTOK,
+        "cache_read": tokens.cache_read * price.cache_read_usd_per_mtok / MTOK,
+        "cache_write_5m": (
+            tokens.cache_write_5m * price.cache_write_5m_usd_per_mtok / MTOK
+        ),
+        "cache_write_1h": (
+            tokens.cache_write_1h * price.cache_write_1h_usd_per_mtok / MTOK
+        ),
+    }
+
+
+def price_tokens(tokens: Tokens, price: Price) -> float:
+    """USD for one bundle of tokens at one price row."""
+    return sum(price_breakdown(tokens, price).values())
 
 
 # ------------------------------------------------------------- attribution

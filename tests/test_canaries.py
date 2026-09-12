@@ -344,3 +344,56 @@ def test_canary_every_detector_has_a_positive_in_this_file():
     assert detector_names <= covered, (
         f"no canary asserts a positive for: {detector_names - covered}"
     )
+
+
+# ----------------------------------------------- the spend-report canary
+
+def test_canary_spend_report_is_not_silently_zero(parsed):
+    """A spend report that totals zero is this codebase's signature bug.
+
+    Runs the whole path -- store rows through aggregation -- and asserts the
+    totals and the per-class shares are real. `ALIASES` once made every token
+    count zero without complaint; this is the guard for the aggregate.
+    """
+    from contrail.cost import PriceTable
+    from contrail.spend import aggregate_spend
+
+    _session, _tree, store, _records = parsed
+    rows = store.transcript_sessions(limit=500)
+    by_session = {
+        r["session_id"]: store.transcript_records_for(r["session_id"]) for r in rows
+    }
+    report = aggregate_spend(rows, by_session, PriceTable(), priced_at=AT)
+
+    assert report.sessions >= 1
+    assert report.tokens.billable_total > 0, "no billable tokens aggregated"
+    assert report.total_usd > 0, "a run with tokens costed at zero"
+    assert report.priced_records > 0
+    assert report.unpriced_records == 0
+
+    # The headline is a share of spend, so it must be a real fraction.
+    assert 0 < report.context_share < 1
+    assert report.class_share("cache_read") > 0
+    assert report.class_share("output") > 0
+
+    # Scope must actually split, since the fixture has a subagent.
+    scopes = {b.key: b for b in report.by_scope}
+    assert scopes["main"].tokens > 0
+    assert scopes["subagent"].tokens > 0, "subagent tokens vanished"
+
+
+def test_canary_cache_economics_are_computed_not_defaulted(parsed):
+    """The fixture writes a 1h cache and reads it, so both sides must be
+    non-zero -- a premium or saving stuck at 0.0 means the pass is dead."""
+    from contrail.cost import PriceTable
+    from contrail.spend import aggregate_spend
+
+    _session, _tree, store, _records = parsed
+    rows = store.transcript_sessions(limit=500)
+    by_session = {
+        r["session_id"]: store.transcript_records_for(r["session_id"]) for r in rows
+    }
+    cache = aggregate_spend(rows, by_session, PriceTable(), priced_at=AT).cache
+    assert cache.actual_usd > 0
+    assert cache.write_premium_usd > 0, "1h cache writes produced no premium"
+    assert cache.read_saving_usd > 0, "cache reads produced no saving"

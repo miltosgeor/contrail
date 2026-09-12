@@ -143,6 +143,43 @@ call makes no API call and has no cost of its own; what it causes is growth in
 the next request's input tokens. Any per-tool figure is a labelled derived
 attribution, never presented as measured.
 
+## Where the money goes
+
+`contrail cost` answers "what did this run cost". `contrail spend` answers the
+other question — "where does my spending concentrate" — across every session
+in the store.
+
+```bash
+contrail spend                          # the whole store, one price basis
+contrail spend --detail                 # also break down by model
+contrail spend --at-model claude-sonnet-4-6   # reprice the same tokens
+contrail spend --at-own-date            # the strict per-session basis
+```
+
+It leads with the answer and puts the evidence underneath: share of spend by
+token class, then by scope and by session, then the caching economics. On the
+author's own corpus the headline is that **88% of spend is context** — cache
+reads plus cache writes — against 11% for output, and that **caching returns
+about 19× its write premium**, which makes it the single best thing happening
+to the bill.
+
+Two deliberate departures, both documented in
+[`contrail/spend.py`](contrail/spend.py):
+
+- **One price basis by default**, not each session's own date. A share
+  computed from several price bases is not comparable to itself. Pricing at
+  own dates would compute the headline from ~10% of this corpus while
+  presenting it as the whole picture; `--at-own-date` keeps the strict view.
+- **Token classes are reported by share of spend, not share of tokens.** By
+  count this corpus is 95% cache reads, which tells you nothing; by spend it
+  is 45% reads and 41% one-hour cache writes, which tells you where to look.
+
+`--at-model` and the caching lines are labelled models rather than
+measurements. Repricing holds token counts fixed, which would not hold in
+reality — a different model writes different amounts and may need more turns.
+Contrail can say what the tokens would have cost; it cannot say whether the
+work would have been done.
+
 ## Cost, and what it is not
 
 Tokens are the stored truth. **No dollar figure is written to the database**,
@@ -264,9 +301,10 @@ contrail/
   prices.json    the price table -- data with effective dates, not code
   detectors.py   repeats, cost concentration, divergence, unhandled errors
   index.html     the screen -- one static file, no build step
+  spend.py       aggregate spend, cache economics, model repricing
   cli.py         serve / traces / show / demo / parse / sessions / tree /
-                 cost / reconcile / findings
-tests/           251 tests, including a canary per detector
+                 cost / reconcile / findings / spend
+tests/           301 tests, including a canary per detector
 docs/spec.md     Why this exists and what the remaining phases are
 ```
 

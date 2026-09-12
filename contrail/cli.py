@@ -11,6 +11,7 @@
     contrail cost <session_id>     attribute cost across the run tree
     contrail reconcile <session>   check the attribution three ways
     contrail findings <session>    run the detectors
+    contrail spend                 where the money goes, across all sessions
 
 The two groups are separate paths on purpose: `parse`/`sessions`/`tree` read
 the JSONL Claude Code already writes and need no collector and no telemetry
@@ -557,6 +558,233 @@ def _make_stdout_safe() -> None:
             pass
 
 
+
+def _money(value: float | None) -> str:
+    """Scale the precision to the magnitude, sign outside the symbol."""
+    if value is None:
+        return "unpriced"
+    sign = "-" if value < 0 else ""
+    magnitude = abs(value)
+    if magnitude >= 1000:
+        body = f"{magnitude:,.0f}"
+    elif magnitude >= 1:
+        body = f"{magnitude:,.2f}"
+    else:
+        body = f"{magnitude:.4f}"
+    return f"{sign}${body}"
+
+
+def _pct(value: float | None) -> str:
+    return "  --" if value is None else f"{value * 100:4.0f}%"
+
+
+def _tok(n: int) -> str:
+    if n >= 1_000_000_000:
+        return f"{n / 1_000_000_000:.2f}B"
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.1f}M"
+    if n >= 1_000:
+        return f"{n / 1_000:.1f}k"
+    return str(n)
+
+
+def cmd_spend(args: argparse.Namespace) -> int:
+    """Aggregate spend across every session in the store.
+
+    The rest of the CLI answers "what happened in this run". This answers
+    "where does my money go", which is a comparison -- so unlike `cost` it
+    prices every session on one basis by default. See contrail/spend.py for
+    why that inverts the usual convention.
+    """
+    from datetime import date, datetime, timezone
+
+    from .cost import PriceTable
+    from .spend import BASIS_OWN_DATE, aggregate_spend, reprice_at_model
+
+    store = Store(args.db)
+    rows = store.transcript_sessions(limit=args.limit)
+    if not rows:
+        print("no parsed sessions yet -- try: contrail parse", file=sys.stderr)
+        return 1
+
+    basis_date = (
+        date.fromisoformat(args.at) if args.at
+        else datetime.now(tz=timezone.utc).date()
+    )
+    by_session = {
+        row["session_id"]: store.transcript_records_for(row["session_id"])
+        for row in rows
+    }
+    prices = PriceTable()
+    report = aggregate_spend(
+        rows, by_session, prices,
+        priced_at=basis_date, own_date=args.at_own_date,
+    )
+
+    total = _money(report.total_usd) if report.priced_records else "unpriced"
+    print(
+        f"contrail spend    {report.sessions} session(s) - "
+        f"{_tok(report.tokens.billable_total)} tokens - {total} "
+        "list-price estimate"
+    )
+    print()
+
+    # On the strict basis the shares below are computed from whatever part of
+    # the corpus could be priced, which on real history is a small slice. That
+    # caveat has to arrive *before* the percentages, not in a footnote after
+    # them -- presenting a share of 10% of the spend as the whole picture is
+    # the distortion the uniform default exists to avoid.
+    if report.basis == BASIS_OWN_DATE and report.unpriced_records:
+        priced_share = (
+            report.priced_records / (report.priced_records + report.unpriced_records)
+        )
+        print(f"  WARNING: every share below is computed from the "
+              f"{priced_share:.0%} of records")
+        print(f"  that could be priced at their own session's date. "
+              f"{len(report.unpriced_sessions)} of "
+              f"{report.sessions} sessions")
+        print("  predate the price table. Drop --at-own-date for one "
+              "comparable basis.")
+        print()
+
+    # --- the answer, before the evidence ---------------------------------
+    context = report.context_share
+    if context is not None:
+        print(f"  Context is {context:.0%} of spend; output is "
+              f"{report.class_share('output'):.0%}.")
+    main, sub = report.by_scope[0], report.by_scope[1]
+    if report.total_usd:
+        print(f"  {main.usd / report.total_usd:.0%} of spend is the main "
+              f"conversation, {sub.usd / report.total_usd:.0%} subagents.")
+    cache = report.cache
+    if cache.return_ratio:
+        verdict = "pays for itself" if cache.pays_for_itself else "is not paying for itself"
+        print(f"  Caching {verdict}: {cache.return_ratio:.0f}x its premium.")
+    print()
+
+    # --- where it goes ---------------------------------------------------
+    print("WHERE IT GOES                                       share of spend")
+    ordered = sorted(
+        report.by_class.values(), key=lambda b: -b.usd
+    )
+    labels = {
+        "cache_read": "cache read", "cache_write_1h": "cache write (1h)",
+        "cache_write_5m": "cache write (5m)", "output": "output",
+        "input": "input (uncached)",
+    }
+    for bucket in ordered:
+        share = report.class_share(bucket.key)
+        print(f"  {labels.get(bucket.key, bucket.key):<34}{_pct(share)}"
+              f"   {_money(bucket.usd):>11}   {_tok(bucket.tokens):>8} tok")
+    print()
+
+    # --- scope and session both name something to do ---------------------
+    print("BY SCOPE")
+    for bucket in report.by_scope:
+        share = bucket.usd / report.total_usd if report.total_usd else None
+        print(f"  {bucket.label:<34}{_pct(share)}   {_money(bucket.usd):>11}"
+              f"   {_tok(bucket.tokens):>8} tok")
+    print()
+
+    print("BY SESSION")
+    shown = report.by_session[: args.sessions]
+    for bucket in shown:
+        share = bucket.usd / report.total_usd if report.total_usd else None
+        flag = "" if bucket.is_priced else "  unpriced"
+        print(f"  {bucket.key[:8]}  {_pct(share)}   {_money(bucket.usd):>11}"
+              f"   {_tok(bucket.tokens):>8} tok   {bucket.label[:38]}{flag}")
+    if len(report.by_session) > len(shown):
+        rest = report.by_session[len(shown):]
+        print(f"  + {len(rest)} more, {_tok(sum(b.tokens for b in rest))} tok")
+    print()
+
+    if args.detail:
+        print("BY MODEL")
+        for bucket in report.by_model:
+            share = bucket.usd / report.total_usd if report.total_usd else None
+            print(f"  {bucket.key:<34}{_pct(share)}   {_money(bucket.usd):>11}"
+                  f"   {_tok(bucket.tokens):>8} tok")
+        print()
+
+    # --- caching: a model, not a measurement -----------------------------
+    print("CACHING - a model, not a measurement")
+    print(f"  write premium paid (1.25x/2.0x vs 1.0x)          "
+          f"{_money(cache.write_premium_usd):>12}")
+    print(f"  read saving returned (0.1x vs 1.0x)              "
+          f"{_money(cache.read_saving_usd):>12}")
+    ratio = f"   {cache.return_ratio:.1f}x" if cache.return_ratio else ""
+    net = f"{'+' if cache.net_usd >= 0 else ''}{_money(cache.net_usd)}"
+    print(f"  net                                              {net:>12}{ratio}")
+    if cache.return_ratio:
+        print(f"  The same tokens uncached: about {_money(cache.uncached_usd)}.")
+    print()
+
+    cadence = report.cadence
+    if cache.ttl_switch_usd is not None and cadence.gaps:
+        direction = "a saving" if cache.ttl_switch_usd < 0 else "more expensive"
+        print("  The 1-hour TTL is the part worth checking. Median gap between")
+        print(f"  requests is {cadence.median_s:.0f}s and {cadence.expiry_rate:.1%} "
+              f"exceed 5 minutes, so a 5-minute")
+        print("  cache would usually still be warm. Repricing those writes at the")
+        print(f"  5m rate, net of the rewrites the {cadence.expiry_rate:.1%} would force,")
+        print(f"  would change total spend by {_money(cache.ttl_switch_usd)}"
+              f" -- {direction}.")
+        print("  Lever: promptCacheTtl, or CLAUDE_CODE_PROMPT_CACHE_TTL=5m")
+        print("  (Claude Code v2.1.242+); FORCE_PROMPT_CACHING_5M=1 forces it.")
+        print("  But check your billing first: 1h on the main conversation with")
+        print("  5m on subagents is the documented default on a Claude")
+        print("  subscription within plan usage -- not a setting you chose. On a")
+        print("  subscription there is no per-token bill to cut, and Claude Code")
+        print("  already drops to 5m once you draw on usage credits.")
+        print()
+
+    # --- optional repricing ----------------------------------------------
+    if args.at_model:
+        repriced = reprice_at_model(
+            rows, by_session, prices, args.at_model,
+            priced_at=basis_date, own_date=args.at_own_date,
+        )
+        print(f"AT {args.at_model.upper()} RATES - an upper bound, not a forecast")
+        if not repriced.priced_records:
+            print(f"  {args.at_model} is not in the price table on "
+                  f"{basis_date.isoformat()}; nothing to compare.")
+        else:
+            print(f"  same tokens at {args.at_model:<24}{_money(repriced.usd):>12}")
+            print(f"  actual                                   "
+                  f"{_money(repriced.baseline_usd):>12}")
+            share = f"   {repriced.share:+.0%}" if repriced.share else ""
+            print(f"  difference                               "
+                  f"{_money(repriced.delta_usd):>12}{share}")
+            print("  It holds token counts fixed, which would not hold: a different")
+            print("  model writes different amounts and may need more or fewer turns.")
+            print("  Contrail can say what the tokens would have cost, never whether")
+            print("  the work would have been done.")
+        print()
+
+    # --- provenance -------------------------------------------------------
+    if report.basis == BASIS_OWN_DATE:
+        print("Each session priced at its own start date (the strict basis), so a")
+        print("session older than the earliest confirmed price contributes tokens")
+        print("but no dollars.")
+    else:
+        print(f"All sessions priced on one basis, {basis_date.isoformat()}, so the")
+        print("shares are comparable to each other. That is deliberate and differs")
+        print("from `contrail cost`, which prices a run at its own date. Use")
+        print("--at-own-date for the strict view.")
+    if report.unpriced_records:
+        print(f"{report.unpriced_records:,} record(s) across "
+              f"{len(report.unpriced_sessions)} session(s) unpriced"
+              + (f" (models: {', '.join(report.unpriced_models)})"
+                 if report.unpriced_models else "")
+              + " -- the totals above are a floor.")
+    if report.non_billable_records:
+        print(f"{report.non_billable_records} record(s) on a non-billable model, "
+              "excluded from cost entirely.")
+    print("Costs are list-price estimates computed from measured token counts.")
+    print("If you are on a subscription rather than API billing, they are notional.")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     _make_stdout_safe()
     parser = argparse.ArgumentParser(prog="contrail", description=__doc__)
@@ -627,6 +855,22 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--evidence", action="store_true",
                    help="print the evidence behind each finding")
     p.set_defaults(func=cmd_findings)
+
+    p = sub.add_parser("spend", help="aggregate cost across every session")
+    p.add_argument("--at", help="price every session on this ISO date "
+                                "(default: today)")
+    p.add_argument("--at-own-date", action="store_true",
+                   help="price each session at its own start date instead "
+                        "(the strict basis; most history reads unpriced)")
+    p.add_argument("--at-model", help="reprice the same tokens at another "
+                                      "model's rates -- an upper bound")
+    p.add_argument("--detail", action="store_true",
+                   help="also break spend down by model")
+    p.add_argument("--limit", type=int, default=500,
+                   help="how many sessions to read from the store")
+    p.add_argument("--sessions", type=int, default=5,
+                   help="how many sessions to list")
+    p.set_defaults(func=cmd_spend)
 
     args = parser.parse_args(argv)
     return args.func(args)
